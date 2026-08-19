@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-data_service}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-data_service}
+      POSTGRES_DB: ${POSTGRES_DB:-data_service}
+    ports:
+      - "5433:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-data_service}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  data-service:
+    build: .
+    env_file: .env
+    environment:
+      # Внутри compose-сети сервисы обращаются друг к другу по имени контейнера, не localhost —
+      # переопределяет DATABASE_URL из .env (тот нацелен на localhost:5433 для хостовой разработки).
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-data_service}:${POSTGRES_PASSWORD:-data_service}@db:5432/${POSTGRES_DB:-data_service}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+
+volumes:
+  db_data:
