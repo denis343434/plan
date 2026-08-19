@@ -58,6 +58,7 @@ def run_parse_task(
 
     client = DataServiceClient()
     account_id: str | None = None
+    cooled_down = False
     try:
         parse_filters = ParseFilters(has_site=filters.has_site)
 
@@ -84,6 +85,10 @@ def run_parse_task(
             task.error = str(exc)
             if account_id is not None:
                 client.cooldown_account(account_id, minutes=30, reason="captcha_detected")
+                # Аккаунт уже переведён в cooldown — release() ниже в finally не должен
+                # затирать это обратно на active (см. account.release() в Data Service,
+                # которая теперь тоже это учитывает; здесь — defense-in-depth).
+                cooled_down = True
 
         task.found = len(raw_leads)
         _insert_leads(client, platform, campaign_id, raw_leads, task)
@@ -93,8 +98,12 @@ def run_parse_task(
     except DataServiceError as exc:
         task.status = TaskStatus.failed
         task.error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - не даём задаче зависнуть на "running" навсегда
+        logger.exception("unhandled error in parse task %s", task_id)
+        task.status = TaskStatus.failed
+        task.error = f"internal error: {exc}"
     finally:
-        if account_id is not None:
+        if account_id is not None and not cooled_down:
             try:
                 client.release_account(account_id)
             except DataServiceError:

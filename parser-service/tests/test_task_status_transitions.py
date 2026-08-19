@@ -3,6 +3,7 @@ import uuid
 import httpx
 import respx
 
+from app.adapters.base import CaptchaDetectedError
 from app.config import settings
 from app.schemas.parse import ParseFiltersSchema
 from app.tasks import TaskStatus, create_task, run_parse_task
@@ -77,6 +78,43 @@ def test_vk_task_fails_when_no_account_available():
 
     assert task.status == TaskStatus.failed
     assert task.error == "no account available"
+
+
+@respx.mock
+def test_captcha_cooldowns_account_and_does_not_release_it(monkeypatch):
+    """Регрессия: cooldown() при капче не должен затираться безусловным release() в finally."""
+    account_id = str(uuid.uuid4())
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
+    )
+    cooldown_route = respx.post(f"{BASE}/accounts/{account_id}/cooldown").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="cooldown"))
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    class _CaptchaAdapter:
+        def search_communities(self, keyword, filters):
+            raise CaptchaDetectedError("captcha detected", partial_leads=[])
+
+    monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _CaptchaAdapter())
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None)
+
+    assert task.status == TaskStatus.failed
+    assert cooldown_route.called
+    assert not release_route.called
 
 
 def test_stub_platform_task_completes_done_without_touching_accounts():
