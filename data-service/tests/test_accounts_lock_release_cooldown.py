@@ -62,6 +62,28 @@ def test_cooldown_expires_and_account_becomes_available(client: TestClient) -> N
     assert available.json()["id"] == account_id
 
 
+def test_release_after_cooldown_does_not_reactivate(client: TestClient) -> None:
+    """Регрессия: caller (например Parser при обнаружении капчи) вызывает cooldown(),
+    а затем безусловно release() в finally — release() не должен затирать cooldown обратно на active."""
+    account_id = _create_account(client, "acc-cooldown-release")
+
+    locked = client.post("/accounts/next-available", json={"platform": "vk", "purpose": "messaging"})
+    assert locked.status_code == 200
+
+    cooled = client.post(
+        f"/accounts/{account_id}/cooldown", json={"minutes": 30, "reason": "captcha_detected"}
+    )
+    assert cooled.status_code == 200
+    assert cooled.json()["status"] == "cooldown"
+
+    released = client.post(f"/accounts/{account_id}/release")
+    assert released.status_code == 200
+    assert released.json()["status"] == "cooldown"
+
+    blocked = client.post("/accounts/next-available", json={"platform": "vk", "purpose": "messaging"})
+    assert blocked.status_code == 409
+
+
 def test_permanent_cooldown_bans_account(client: TestClient) -> None:
     account_id = _create_account(client, "acc-ban")
 

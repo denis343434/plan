@@ -124,7 +124,11 @@ def lock(db: Session, account_id: UUID, lock_ttl_seconds: int, task_ref: str | N
 
 def release(db: Session, account_id: UUID) -> Account:
     account = _get_locked(db, account_id)
-    account.status = "active"
+    # Только "locked" возвращается в "active" — если аккаунт уже переведён в cooldown/banned/flood
+    # (например cooldown() был вызван на этом же аккаунте до release()), release() не должен
+    # затирать эту защиту обратно на active.
+    if account.status == "locked":
+        account.status = "active"
     account.locked_until = None
     account.locked_task_ref = None
     db.commit()
