@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VK Lead-Gen — панель управления</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e8ec;
+    --muted: #8b93a3;
+    --accent: #4f8cff;
+    --ok: #35c07a;
+    --warn: #e0a83a;
+    --err: #e05555;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .status-bar { display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.ok { background: var(--ok); }
+  .dot.err { background: var(--err); }
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px;
+    display: grid;
+    gap: 24px;
+    grid-template-columns: 1fr 1fr;
+  }
+  section.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  section.panel.wide { grid-column: 1 / -1; }
+  h2 { font-size: 15px; margin: 0 0 12px; font-weight: 600; }
+  h3 { font-size: 13px; margin: 16px 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  input, select, textarea {
+    background: #0f1115;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  input[type=text], input[type=number] { width: 140px; }
+  button {
+    background: var(--accent);
+    border: none;
+    color: white;
+    padding: 7px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover { opacity: .9; }
+  button.secondary { background: #2a2f3a; }
+  button.danger { background: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.selected td { background: #1c2230; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: #1a1e27; }
+  .badge { padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge.active, .badge.completed, .badge.done, .badge.sent, .badge.contacted { background: rgba(53,192,122,.15); color: var(--ok); }
+  .badge.locked, .badge.running, .badge.parsing, .badge.messaging, .badge.queued, .badge.new { background: rgba(224,168,58,.15); color: var(--warn); }
+  .badge.banned, .badge.failed, .badge.paused, .badge.cooldown, .badge.flood, .badge.rejected { background: rgba(224,85,85,.15); color: var(--err); }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 12.5px; padding: 8px 0; }
+  .stats-row { display: flex; gap: 18px; margin: 10px 0; flex-wrap: wrap; }
+  .stat { background: #0f1115; border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; min-width: 70px; }
+  .stat .n { font-size: 20px; font-weight: 700; }
+  .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .toast {
+    position: fixed; bottom: 18px; right: 18px; background: #1c2230; border: 1px solid var(--border);
+    padding: 10px 16px; border-radius: 8px; font-size: 13px; max-width: 360px; display: none;
+  }
+  .toast.err { border-color: var(--err); color: var(--err); }
+  .row-actions { display: flex; gap: 6px; }
+  .row-actions button { padding: 4px 8px; font-size: 11px; }
+  .campaign-detail-header { display: flex; justify-content: space-between; align-items: center; }
+  code.small { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>VK Lead-Gen — панель управления</h1>
+  <div class="status-bar" id="statusBar"></div>
+</header>
+
+<main>
+
+  <section class="panel">
+    <h2>Аккаунты</h2>
+    <form id="accountForm">
+      <input type="text" id="accLogin" placeholder="логин" required>
+      <select id="accPurpose">
+        <option value="both">оба назначения</option>
+        <option value="parsing">только парсинг</option>
+        <option value="messaging">только рассылка</option>
+      </select>
+      <input type="number" id="accHourly" placeholder="лимит/час" value="100">
+      <input type="number" id="accDaily" placeholder="лимит/сутки" value="1000">
+      <button type="submit">Создать</button>
+    </form>
+    <table>
+      <thead><tr><th>Логин</th><th>Назначение</th><th>Статус</th><th>Нагрузка</th><th></th></tr></thead>
+      <tbody id="accountsBody"></tbody>
+    </table>
+    <div class="empty" id="accountsEmpty" style="display:none">Нет аккаунтов</div>
+  </section>
+
+  <section class="panel">
+    <h2>Кампании</h2>
+    <form id="campaignForm">
+      <input type="text" id="campName" placeholder="название" required>
+      <select id="campPlatform">
+        <option value="vk">VK</option>
+        <option value="telegram">Telegram</option>
+        <option value="instagram">Instagram</option>
+      </select>
+      <input type="text" id="campKeyword" placeholder="ключевое слово" required>
+      <button type="submit">Создать</button>
+    </form>
+    <table>
+      <thead><tr><th>Название</th><th>Ключевое слово</th><th>Статус</th></tr></thead>
+      <tbody id="campaignsBody"></tbody>
+    </table>
+    <div class="empty" id="campaignsEmpty" style="display:none">Нет кампаний</div>
+  </section>
+
+  <section class="panel wide" id="detailPanel" style="display:none">
+    <div class="campaign-detail-header">
+      <h2>Кампания: <span id="detailName"></span> <code class="small" id="detailId"></code></h2>
+      <div class="row-actions">
+        <button id="startBtn">Запустить</button>
+        <button class="secondary" id="refreshBtn">Обновить</button>
+      </div>
+    </div>
+
+    <div class="stats-row" id="statsRow"></div>
+    <div id="detailStatus" class="muted" style="margin-bottom: 10px;"></div>
+
+    <h3>Шаблон сообщения</h3>
+    <form id="templateForm">
+      <select id="tplVariant">
+        <option value="A">Вариант A</option>
+        <option value="B">Вариант B</option>
+      </select>
+      <textarea id="tplBody" placeholder="Здравствуйте, {{org_name}}!" style="flex: 1; min-width: 260px;"></textarea>
+      <button type="submit">Сохранить шаблон</button>
+    </form>
+    <div id="templatesList" class="muted" style="font-size:12px;"></div>
+
+    <h3>Лиды кампании</h3>
+    <table>
+      <thead><tr><th>Название</th><th>Ссылка на группу</th><th>Статус</th></tr></thead>
+      <tbody id="leadsBody"></tbody>
+    </table>
+    <div class="empty" id="leadsEmpty" style="display:none">Лидов пока нет</div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const HOST = location.hostname;
+const API = {
+  data: `http://${HOST}:8001`,
+  parser: `http://${HOST}:8002`,
+  messaging: `http://${HOST}:8003`,
+  orchestrator: `http://${HOST}:8004`,
+};
+
+let selectedCampaignId = null;
+let pollTimer = null;
+
+// Отображаемые русские подписи для служебных enum-значений API — сами значения
+// (используются как CSS-класс и уходят обратно в запросы) остаются как есть.
+const RU_SERVICE_NAME = {
+  'data-service': 'БД-сервис', parser: 'Парсер', messaging: 'Отправка', orchestrator: 'Оркестратор',
+};
+const RU_PURPOSE = { both: 'оба назначения', parsing: 'парсинг', messaging: 'рассылка' };
+const RU_ACCOUNT_STATUS = {
+  active: 'активен', locked: 'занят', cooldown: 'пауза', flood: 'флуд-контроль', banned: 'забанен',
+};
+const RU_CAMPAIGN_STATUS = { draft: 'черновик', running: 'выполняется', paused: 'приостановлена', completed: 'завершена' };
+const RU_PHASE = { idle: 'ожидание', parsing: 'парсинг', messaging: 'рассылка', done: 'готово', failed: 'ошибка', timeout: 'таймаут' };
+const RU_LEAD_STATUS = { new: 'новый', queued: 'в очереди', contacted: 'написали', replied: 'ответили', rejected: 'отклонён' };
+const RU_STATS_LABEL = { new: 'новые', queued: 'в очереди', contacted: 'написали', replied: 'ответили', rejected: 'отклонены' };
+
+function badge(value, dict) {
+  return `<span class="badge ${value}">${(dict && dict[value]) || value}</span>`;
+}
+
+function showToast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isErr ? ' err' : '');
+  t.style.display = 'block';
+  clearTimeout(t._hideTimer);
+  t._hideTimer = setTimeout(() => t.style.display = 'none', 4000);
+}
+
+async function api(base, path, options) {
+  const res = await fetch(base + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* empty body */ }
+  if (!res.ok) {
+    const detail = body && body.detail ? body.detail : res.statusText;
+    throw new Error(`${res.status} ${detail}`);
+  }
+  return body;
+}
+
+// ---------- health ----------
+async function refreshHealth() {
+  const bar = document.getElementById('statusBar');
+  const services = [
+    ['data-service', API.data],
+    ['parser', API.parser],
+    ['messaging', API.messaging],
+    ['orchestrator', API.orchestrator],
+  ];
+  const results = await Promise.all(services.map(async ([name, base]) => {
+    try {
+      await api(base, '/health');
+      return [name, true];
+    } catch (e) {
+      return [name, false];
+    }
+  }));
+  bar.innerHTML = results.map(([name, ok]) =>
+    `<span><span class="dot ${ok ? 'ok' : 'err'}"></span>${RU_SERVICE_NAME[name] || name}</span>`
+  ).join('');
+}
+
+// ---------- accounts ----------
+async function refreshAccounts() {
+  const body = document.getElementById('accountsBody');
+  const empty = document.getElementById('accountsEmpty');
+  try {
+    const accounts = await api(API.data, '/accounts');
+    empty.style.display = accounts.length ? 'none' : 'block';
+    body.innerHTML = accounts.map(a => `
+      <tr>
+        <td>${a.login}</td>
+        <td>${RU_PURPOSE[a.purpose] || a.purpose}</td>
+        <td>${badge(a.status, RU_ACCOUNT_STATUS)}</td>
+        <td class="muted">${a.hourly_used}/${a.hourly_limit} ч · ${a.daily_used}/${a.daily_limit} сут</td>
+        <td class="row-actions">
+          <button class="secondary" onclick="setFakeSession('${a.id}')">тестовая сессия</button>
+        </td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    showToast('Не удалось загрузить аккаунты: ' + e.message, true);
+  }
+}
+
+async function setFakeSession(accountId) {
+  try {
+    await api(API.data, `/accounts/${accountId}/session`, {
+      method: 'PUT',
+      body: JSON.stringify({ storage_state: { cookies: [], origins: [] } }),
+    });
+    showToast('Сессия установлена');
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+}
+
+document.getElementById('accountForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  try {
+    await api(API.data, '/accounts', {
+      method: 'POST',
+      body: JSON.stringify({
+        platform: 'vk',
+        login: document.getElementById('accLogin').value,
+        purpose: document.getElementById('accPurpose').value,
+        hourly_limit: Number(document.getElementById('accHourly').value) || 100,
+        daily_limit: Number(document.getElementById('accDaily').value) || 1000,
+      }),
+    });
+    document.getElementById('accountForm').reset();
+    showToast('Аккаунт создан');
+    refreshAccounts();
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+});
+
+// ---------- campaigns ----------
+async function refreshCampaigns() {
+  const body = document.getElementById('campaignsBody');
+  const empty = document.getElementById('campaignsEmpty');
+  try {
+    const campaigns = await api(API.data, '/campaigns');
+    empty.style.display = campaigns.length ? 'none' : 'block';
+    body.innerHTML = campaigns.map(c => `
+      <tr class="clickable ${c.id === selectedCampaignId ? 'selected' : ''}" onclick="selectCampaign('${c.id}', '${c.name.replace(/'/g, "&#39;")}')">
+        <td>${c.name}</td>
+        <td>${c.keyword}</td>
+        <td>${badge(c.status, RU_CAMPAIGN_STATUS)}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    showToast('Не удалось загрузить кампании: ' + e.message, true);
+  }
+}
+
+document.getElementById('campaignForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  try {
+    const campaign = await api(API.orchestrator, '/campaigns', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: document.getElementById('campName').value,
+        platform: document.getElementById('campPlatform').value,
+        keyword: document.getElementById('campKeyword').value,
+      }),
+    });
+    document.getElementById('campaignForm').reset();
+    showToast('Кампания создана');
+    await refreshCampaigns();
+    selectCampaign(campaign.id, campaign.name);
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+});
+
+// ---------- campaign detail ----------
+function selectCampaign(id, name) {
+  selectedCampaignId = id;
+  document.getElementById('detailPanel').style.display = 'block';
+  document.getElementById('detailName').textContent = name;
+  document.getElementById('detailId').textContent = id;
+  refreshCampaigns();
+  refreshDetail();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refreshDetail, 3000);
+}
+
+async function refreshDetail() {
+  if (!selectedCampaignId) return;
+  try {
+    const data = await api(API.orchestrator, `/campaigns/${selectedCampaignId}`);
+    const s = data.stats || {};
+    document.getElementById('statsRow').innerHTML = Object.entries(s).map(([k, v]) => `
+      <div class="stat"><div class="n">${v}</div><div class="l">${RU_STATS_LABEL[k] || k}</div></div>
+    `).join('');
+    document.getElementById('detailStatus').innerHTML =
+      `фаза: ${badge(data.phase, RU_PHASE)} · статус кампании: ${badge(data.campaign.status, RU_CAMPAIGN_STATUS)}` +
+      (data.error ? ` · <span style="color:var(--err)">ошибка: ${data.error}</span>` : '');
+  } catch (e) {
+    document.getElementById('detailStatus').textContent = 'Ошибка загрузки статуса: ' + e.message;
+  }
+  refreshLeads();
+  refreshTemplates();
+}
+
+async function refreshTemplates() {
+  if (!selectedCampaignId) return;
+  try {
+    const templates = await api(API.data, '/templates');
+    const own = templates.filter(t => t.campaign_id === selectedCampaignId);
+    document.getElementById('templatesList').textContent = own.length
+      ? 'сохранено: ' + own.map(t => `${t.variant} — "${t.body}"`).join(' · ')
+      : 'шаблонов пока нет';
+  } catch (e) {
+    // тихо: не критично для основного статуса
+  }
+}
+
+async function refreshLeads() {
+  if (!selectedCampaignId) return;
+  const body = document.getElementById('leadsBody');
+  const empty = document.getElementById('leadsEmpty');
+  try {
+    const leads = await api(API.data, `/leads?campaign_id=${selectedCampaignId}`);
+    empty.style.display = leads.length ? 'none' : 'block';
+    body.innerHTML = leads.map(l => `
+      <tr>
+        <td>${l.title || ''}</td>
+        <td class="muted">${l.group_url || ''}</td>
+        <td>${badge(l.status, RU_LEAD_STATUS)}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    // тихо: лиды не критичны для основного статуса
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  if (!selectedCampaignId) return;
+  try {
+    await api(API.orchestrator, `/campaigns/${selectedCampaignId}/start`, { method: 'POST' });
+    showToast('Кампания запущена');
+    refreshDetail();
+  } catch (e) {
+    showToast('Ошибка запуска: ' + e.message, true);
+  }
+});
+
+document.getElementById('refreshBtn').addEventListener('click', refreshDetail);
+
+document.getElementById('templateForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  if (!selectedCampaignId) return;
+  try {
+    await api(API.data, '/templates', {
+      method: 'POST',
+      body: JSON.stringify({
+        campaign_id: selectedCampaignId,
+        variant: document.getElementById('tplVariant').value,
+        body: document.getElementById('tplBody').value,
+      }),
+    });
+    document.getElementById('tplBody').value = '';
+    showToast('Шаблон сохранён');
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+});
+
+// ---------- init ----------
+refreshHealth();
+refreshAccounts();
+refreshCampaigns();
+setInterval(refreshHealth, 8000);
+setInterval(refreshAccounts, 8000);
+setInterval(refreshCampaigns, 8000);
+</script>
+
+</body>
+</html>

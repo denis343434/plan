@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.logging_conf import configure_logging
 from app.routers import send
@@ -6,6 +7,12 @@ from app.routers import send
 configure_logging()
 
 app = FastAPI(title="Messaging Service")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(send.router)
 
 

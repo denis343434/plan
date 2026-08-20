@@ -1,10 +1,18 @@
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.exceptions import NoAccountAvailableError, NotFoundError
 from app.routers import accounts, campaigns, leads, messages, templates
 
 app = FastAPI(title="Data Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(leads.router)
 app.include_router(accounts.router)

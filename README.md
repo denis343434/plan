@@ -151,16 +151,6 @@ curl "http://localhost:8001/messages?account_id=<account_id>"
   `messaging-service/scripts/vk_manual_login.py`.
 - Стадии `parsing`/`messaging` опрашиваются поллингом (`POLL_INTERVAL_SEC`/`POLL_TIMEOUT_SEC`
   в `orchestrator-service`), без брокера очередей — соответствует MVP-решению в `architecture.md`.
-- **Известные баги в бизнес-логике (не влияют на этот smoke-флоу, т.к. fake/dry-run адаптеры
-  всегда "успешны", но критичны при реальной эксплуатации — исправление вне рамок Фазы 5):**
-  - `parser-service/app/tasks.py` — `release_account()` в `finally` безусловно перезатирает
-    аккаунт обратно в `active` даже после `cooldown_account()` при обнаружении капчи (см.
-    `data-service/app/crud/accounts.py:release()`, который не проверяет текущий статус).
-    Cooldown-защита от бана фактически не работает.
-  - `messaging-service/app/tasks.py` — если отправка лиду не удалась без признаков флуда
-    (`success=False`, `flood_detected=False`), статус лида не меняется и остаётся `new`,
-    внешний цикл `run_send_task` берёт тот же лид повторно — бесконечный цикл, задача никогда
-    не завершается.
 
 ## Локальная разработка отдельных сервисов
 
