@@ -30,3 +30,10 @@ def get_session(db: Session, account_id: UUID) -> tuple[SessionModel, dict]:
     if session is None:
         raise NotFoundError(f"session for account {account_id} not found")
     return session, decrypt_json(session.storage_state_enc)
+
+
+def existing_session_account_ids(db: Session, account_ids: list[UUID]) -> set[UUID]:
+    if not account_ids:
+        return set()
+    stmt = select(SessionModel.account_id).where(SessionModel.account_id.in_(account_ids))
+    return set(db.execute(stmt).scalars().all())

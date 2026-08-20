@@ -31,6 +31,10 @@ class ParseTask:
     inserted: int = 0
     skipped: int = 0
     error: str | None = None
+    # Живой прогресс проверки кандидатов на фильтр "есть сайт" (см. adapters/vk.py) —
+    # checked/progress_total растут по ходу поиска, до того как found вообще станет известен.
+    progress_checked: int = 0
+    progress_total: int = 0
 
 
 TASKS: dict[uuid.UUID, ParseTask] = {}
@@ -60,7 +64,7 @@ def run_parse_task(
     account_id: str | None = None
     cooled_down = False
     try:
-        parse_filters = ParseFilters(has_site=filters.has_site)
+        parse_filters = ParseFilters(has_site=filters.has_site, max_groups=filters.max_groups)
 
         if platform == "vk":
             try:
@@ -78,8 +82,12 @@ def run_parse_task(
         else:
             adapter = get_adapter(platform)
 
+        def on_progress(checked: int, total: int) -> None:
+            task.progress_checked = checked
+            task.progress_total = total
+
         try:
-            raw_leads = adapter.search_communities(keyword, parse_filters)
+            raw_leads = adapter.search_communities(keyword, parse_filters, on_progress=on_progress)
         except CaptchaDetectedError as exc:
             raw_leads = exc.partial_leads
             task.error = str(exc)

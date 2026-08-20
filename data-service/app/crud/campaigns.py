@@ -34,3 +34,11 @@ def update_campaign(db: Session, campaign_id: UUID, update: CampaignUpdate) -> C
     db.commit()
     db.refresh(campaign)
     return campaign
+
+
+def delete_campaign(db: Session, campaign_id: UUID) -> None:
+    # leads.campaign_id/templates.campaign_id — ON DELETE SET NULL (см. alembic-миграцию), т.е.
+    # сами лиды и шаблоны не удаляются, только теряют привязку к этой кампании.
+    campaign = get_campaign(db, campaign_id)
+    db.delete(campaign)
+    db.commit()

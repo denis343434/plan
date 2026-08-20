@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.crud.messages import usage_counts
+from app.crud.sessions import existing_session_account_ids
 from app.exceptions import NoAccountAvailableError, NotFoundError
 from app.models.account import Account
 from app.schemas.account import AccountCreate, AccountOut
@@ -18,7 +19,7 @@ def create_account(db: Session, account: AccountCreate) -> Account:
     return db_account
 
 
-def _to_out(account: Account, hourly_used: int, daily_used: int) -> AccountOut:
+def _to_out(account: Account, hourly_used: int, daily_used: int, has_session: bool) -> AccountOut:
     return AccountOut(
         id=account.id,
         platform=account.platform,
@@ -37,6 +38,7 @@ def _to_out(account: Account, hourly_used: int, daily_used: int) -> AccountOut:
         last_used_at=account.last_used_at,
         hourly_used=hourly_used,
         daily_used=daily_used,
+        has_session=has_session,
     )
 
 
@@ -55,8 +57,10 @@ def list_accounts(
         stmt = stmt.where(Account.purpose == purpose)
     accounts = list(db.execute(stmt).scalars().all())
 
-    usage = usage_counts(db, [a.id for a in accounts])
-    return [_to_out(a, *usage.get(a.id, (0, 0))) for a in accounts]
+    ids = [a.id for a in accounts]
+    usage = usage_counts(db, ids)
+    with_session = existing_session_account_ids(db, ids)
+    return [_to_out(a, *usage.get(a.id, (0, 0)), a.id in with_session) for a in accounts]
 
 
 def next_available(
@@ -97,7 +101,8 @@ def next_available(
         account.last_used_at = now
         db.commit()
         db.refresh(account)
-        return _to_out(account, hourly_used, daily_used)
+        has_session = bool(existing_session_account_ids(db, [account.id]))
+        return _to_out(account, hourly_used, daily_used, has_session)
 
     raise NoAccountAvailableError("all candidate accounts are rate-limited")
 
@@ -153,8 +158,31 @@ def cooldown(
     return account
 
 
+def activate(db: Session, account_id: UUID) -> Account:
+    # В отличие от release() — явное ручное действие ("Продолжить"), безусловно возвращает
+    # аккаунт в active из любого состояния (cooldown/banned/locked), включая паузу, поставленную
+    # через pause()/cooldown(). Это и есть "ручной разбор", о котором явно говорит architecture.md
+    # для captcha/flood-блокировок — не автоматика, а осознанное решение оператора.
+    account = _get_locked(db, account_id)
+    account.status = "active"
+    account.cooldown_until = None
+    account.locked_until = None
+    account.locked_task_ref = None
+    db.commit()
+    db.refresh(account)
+    return account
+
+
 def get_account(db: Session, account_id: UUID) -> Account:
     account = db.get(Account, account_id)
     if account is None:
         raise NotFoundError(f"account {account_id} not found")
     return account
+
+
+def delete_account(db: Session, account_id: UUID) -> None:
+    # sessions.account_id/messages.account_id — ON DELETE CASCADE (см. alembic-миграцию),
+    # т.е. сессия и вся история сообщений этого аккаунта удаляются вместе с ним.
+    account = get_account(db, account_id)
+    db.delete(account)
+    db.commit()

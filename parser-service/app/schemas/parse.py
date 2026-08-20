@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 class ParseFiltersSchema(BaseModel):
     has_site: bool | None = None
+    max_groups: int | None = None
 
 
 class ParseRequest(BaseModel):
@@ -21,3 +22,5 @@ class ParseTaskOut(BaseModel):
     inserted: int = 0
     skipped: int = 0
     error: str | None = None
+    progress_checked: int = 0
+    progress_total: int = 0

@@ -30,3 +30,8 @@ def update_campaign(
     campaign_id: UUID, update: CampaignUpdate, db: Session = Depends(get_db)
 ) -> CampaignOut:
     return crud.update_campaign(db, campaign_id, update)
+
+
+@router.delete("/{campaign_id}", status_code=204)
+def delete_campaign(campaign_id: UUID, db: Session = Depends(get_db)) -> None:
+    crud.delete_campaign(db, campaign_id)

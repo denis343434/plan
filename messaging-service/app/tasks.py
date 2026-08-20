@@ -116,7 +116,18 @@ def _process_lead(client: DataServiceClient, task: SendTask, lead: dict, templat
 
     cooled_down = False
     try:
-        session = client.get_session(account["id"])
+        try:
+            session = client.get_session(account["id"])
+        except DataServiceError as exc:
+            # Проблема конкретно с ЭТИМ аккаунтом (например нет сохранённой сессии) не должна
+            # ронять всю задачу — иначе при нескольких аккаунтах в пуле один "битый" тормозит
+            # рассылку для остальных, рабочих. Лид остаётся status=new и ретраится в следующем
+            # запуске кампании — как и любая другая непроблема-лида ошибка отправки ниже.
+            logger.warning("account %s unusable for lead %s (%s), skipping this attempt", account["id"], lead["id"], exc)
+            task.failed += 1
+            task.permanently_failed_lead_ids.add(lead["id"])
+            return True
+
         adapter = get_adapter(lead["platform"], storage_state=session["storage_state"])
 
         template = templating.choose_template(templates)
@@ -129,7 +140,7 @@ def _process_lead(client: DataServiceClient, task: SendTask, lead: dict, templat
             client.post_message(_message_payload(lead, account, template, text, "sent"))
             task.sent += 1
         else:
-            client.post_message(_message_payload(lead, account, template, text, "failed"))
+            client.post_message(_message_payload(lead, account, template, text, "failed", result.error))
             task.failed += 1
             if result.flood_detected:
                 client.cooldown_account(
@@ -152,11 +163,14 @@ def _process_lead(client: DataServiceClient, task: SendTask, lead: dict, templat
     return True
 
 
-def _message_payload(lead: dict, account: dict, template: dict, text: str, delivery_status: str) -> dict:
+def _message_payload(
+    lead: dict, account: dict, template: dict, text: str, delivery_status: str, error_reason: str | None = None
+) -> dict:
     return {
         "lead_id": lead["id"],
         "account_id": account["id"],
         "template_variant": template.get("variant"),
         "text_sent": text,
         "delivery_status": delivery_status,
+        "error_reason": error_reason,
     }

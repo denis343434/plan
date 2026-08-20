@@ -30,3 +30,4 @@ class Message(UUIDPK, Base):
         nullable=False, default="pending", server_default="pending"
     )
     reply_status: Mapped[str] = mapped_column(nullable=False, default="none", server_default="none")
+    error_reason: Mapped[str | None] = mapped_column(default=None)

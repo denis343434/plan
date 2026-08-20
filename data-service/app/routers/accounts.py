@@ -18,10 +18,14 @@ from app.schemas.session import SessionIn, SessionOut
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 
+def _has_session(db: Session, account_id: UUID) -> bool:
+    return bool(sessions_crud.existing_session_account_ids(db, [account_id]))
+
+
 @router.post("", response_model=AccountOut)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)) -> AccountOut:
     db_account = crud.create_account(db, account)
-    return crud._to_out(db_account, 0, 0)
+    return crud._to_out(db_account, 0, 0, False)
 
 
 @router.get("", response_model=list[AccountOut])
@@ -54,14 +58,14 @@ def lock_account(
 ) -> AccountOut:
     account = crud.lock(db, account_id, lock_ttl_seconds, task_ref)
     usage = crud.usage_counts(db, [account.id])
-    return crud._to_out(account, *usage.get(account.id, (0, 0)))
+    return crud._to_out(account, *usage.get(account.id, (0, 0)), _has_session(db, account.id))
 
 
 @router.post("/{account_id}/release", response_model=AccountOut)
 def release_account(account_id: UUID, db: Session = Depends(get_db)) -> AccountOut:
     account = crud.release(db, account_id)
     usage = crud.usage_counts(db, [account.id])
-    return crud._to_out(account, *usage.get(account.id, (0, 0)))
+    return crud._to_out(account, *usage.get(account.id, (0, 0)), _has_session(db, account.id))
 
 
 @router.post("/{account_id}/cooldown", response_model=AccountOut)
@@ -70,7 +74,19 @@ def cooldown_account(
 ) -> AccountOut:
     account = crud.cooldown(db, account_id, request.minutes, request.permanent, request.reason)
     usage = crud.usage_counts(db, [account.id])
-    return crud._to_out(account, *usage.get(account.id, (0, 0)))
+    return crud._to_out(account, *usage.get(account.id, (0, 0)), _has_session(db, account.id))
+
+
+@router.post("/{account_id}/activate", response_model=AccountOut)
+def activate_account(account_id: UUID, db: Session = Depends(get_db)) -> AccountOut:
+    account = crud.activate(db, account_id)
+    usage = crud.usage_counts(db, [account.id])
+    return crud._to_out(account, *usage.get(account.id, (0, 0)), _has_session(db, account.id))
+
+
+@router.delete("/{account_id}", status_code=204)
+def delete_account(account_id: UUID, db: Session = Depends(get_db)) -> None:
+    crud.delete_account(db, account_id)
 
 
 @router.put("/{account_id}/session", response_model=SessionOut)

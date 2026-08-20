@@ -1,4 +1,5 @@
 import logging
+from typing import Callable
 
 from app.adapters.base import ParseFilters, RawLead
 
@@ -15,6 +16,13 @@ class NotImplementedAdapter:
     def __init__(self, platform: str) -> None:
         self._platform = platform
 
-    def search_communities(self, keyword: str, filters: ParseFilters) -> list[RawLead]:
+    def search_communities(
+        self,
+        keyword: str,
+        filters: ParseFilters,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[RawLead]:
         logger.info("platform %s not supported yet", self._platform)
+        if on_progress is not None:
+            on_progress(0, 0)
         return []

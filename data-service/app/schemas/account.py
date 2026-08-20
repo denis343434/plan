@@ -35,6 +35,7 @@ class AccountOut(BaseModel):
     last_used_at: datetime | None
     hourly_used: int
     daily_used: int
+    has_session: bool
 
 
 class NextAvailableRequest(BaseModel):

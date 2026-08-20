@@ -1,10 +1,13 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 @dataclass
 class ParseFilters:
     has_site: bool | None = None
+    # Верхняя граница числа кандидатов, которых стоит проверять/возвращать за один прогон
+    # поиска — None означает "без ограничения" (берём всё, что нашлось на странице выдачи).
+    max_groups: int | None = None
 
 
 @dataclass
@@ -16,7 +19,12 @@ class RawLead:
 
 
 class SourceAdapter(Protocol):
-    def search_communities(self, keyword: str, filters: ParseFilters) -> list[RawLead]: ...
+    def search_communities(
+        self,
+        keyword: str,
+        filters: ParseFilters,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[RawLead]: ...
 
 
 class CaptchaDetectedError(Exception):

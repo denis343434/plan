@@ -20,3 +20,4 @@ class CampaignStatusOut(BaseModel):
     phase: str
     error: str | None = None
     stats: dict[str, int]
+    progress: dict | None = None

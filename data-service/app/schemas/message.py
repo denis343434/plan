@@ -13,6 +13,7 @@ class MessageCreate(BaseModel):
     text_sent: str
     delivery_status: DeliveryStatus = DeliveryStatus.pending
     reply_status: ReplyStatus = ReplyStatus.none
+    error_reason: str | None = None
 
 
 class MessageOut(BaseModel):
@@ -26,3 +27,4 @@ class MessageOut(BaseModel):
     sent_at: datetime
     delivery_status: DeliveryStatus
     reply_status: ReplyStatus
+    error_reason: str | None

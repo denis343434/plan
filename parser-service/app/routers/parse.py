@@ -34,4 +34,6 @@ def parse_status(task_id: UUID) -> ParseTaskOut:
         inserted=task.inserted,
         skipped=task.skipped,
         error=task.error,
+        progress_checked=task.progress_checked,
+        progress_total=task.progress_total,
     )

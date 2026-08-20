@@ -34,6 +34,10 @@ class OrchestrationTask:
     campaign_id: uuid.UUID
     phase: OrchestrationPhase = OrchestrationPhase.idle
     error: str | None = None
+    # Живой прогресс текущей фазы (parsing: {"checked": N, "total": M} из Parser Service;
+    # messaging: {"sent": N, "failed": M, "skipped": K} из Messaging Service) — обновляется
+    # на каждом опросе _poll(), видно через GET /campaigns/{id} ещё до завершения фазы.
+    progress: dict | None = None
 
 
 TASKS: dict[uuid.UUID, OrchestrationTask] = {}
@@ -49,7 +53,7 @@ def get_task(campaign_id: uuid.UUID) -> OrchestrationTask | None:
     return TASKS.get(campaign_id)
 
 
-def run_campaign_flow(campaign_id: uuid.UUID) -> None:
+def run_campaign_flow(campaign_id: uuid.UUID, max_groups: int | None = None) -> None:
     task = TASKS[campaign_id]
 
     data_client = DataServiceClient()
@@ -60,24 +64,37 @@ def run_campaign_flow(campaign_id: uuid.UUID) -> None:
         data_client.update_campaign_status(campaign_id, "running")
 
         task.phase = OrchestrationPhase.parsing
+        task.progress = None
         parse_task = parser_client.start_parse(
-            platform=campaign["platform"], keyword=campaign["keyword"], campaign_id=campaign_id
+            platform=campaign["platform"],
+            keyword=campaign["keyword"],
+            campaign_id=campaign_id,
+            filters={"max_groups": max_groups} if max_groups is not None else None,
         )
         outcome, last_status = _poll(
             fetch_status=lambda: parser_client.get_parse_status(parse_task["task_id"]),
             is_done=lambda s: s["status"] in _PARSE_DONE_STATUSES,
             is_failed=lambda s: s["status"] in _PARSE_FAILED_STATUSES,
+            on_status=lambda s: setattr(
+                task, "progress",
+                {"checked": s.get("progress_checked", 0), "total": s.get("progress_total", 0), "found": s.get("found", 0)},
+            ),
         )
         if outcome != "done":
             _finish_with_problem(data_client, task, outcome, f"parser: {last_status.get('error') or last_status.get('status')}")
             return
 
         task.phase = OrchestrationPhase.messaging
+        task.progress = None
         messaging_client.start_send(campaign_id)
         outcome, last_status = _poll(
             fetch_status=lambda: messaging_client.get_send_status(campaign_id),
             is_done=lambda s: s["status"] in _SEND_DONE_STATUSES,
             is_failed=lambda s: s["status"] in _SEND_FAILED_STATUSES,
+            on_status=lambda s: setattr(
+                task, "progress",
+                {"sent": s.get("sent", 0), "failed": s.get("failed", 0), "skipped": s.get("skipped", 0)},
+            ),
         )
         if outcome != "done":
             _finish_with_problem(data_client, task, outcome, f"messaging: {last_status.get('error') or last_status.get('status')}")
@@ -109,6 +126,7 @@ def _poll(
     fetch_status: Callable[[], dict],
     is_done: Callable[[dict], bool],
     is_failed: Callable[[dict], bool],
+    on_status: Callable[[dict], None] | None = None,
     interval: float | None = None,
     timeout: float | None = None,
 ) -> tuple[str, dict]:
@@ -119,6 +137,8 @@ def _poll(
 
     while True:
         status = fetch_status()
+        if on_status is not None:
+            on_status(status)
         if is_done(status):
             return "done", status
         if is_failed(status):
