@@ -23,7 +23,7 @@ class SourceAdapter(Protocol):
         self,
         keyword: str,
         filters: ParseFilters,
-        on_progress: Callable[[int, int], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]: ...
 
 

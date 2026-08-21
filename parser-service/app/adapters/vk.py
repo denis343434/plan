@@ -27,6 +27,17 @@ _SEARCH_URL = "https://vk.com/search/communities?q={keyword}"
 # поиск отдаёт 0 результатов по этому URL (поле поиска в шапке остаётся пустым). Актуальный
 # путь — /search/communities?q=, карточки — VKUI RichCell с data-testid="group_item_desktop_list".
 _GROUP_CARD_SELECTOR = '[data-testid="group_item_desktop_list"]'
+# Выдача VK подгружает карточки бесконечным скроллом порциями (~20 за раз) — без явного
+# докручивания в DOM всегда только первая порция, независимо от filters.max_groups.
+_SCROLL_WAIT_MS = 1500
+_MAX_SCROLL_ATTEMPTS = 25
+# Сколько подряд скроллов без роста DOM считать концом выдачи. Проверено вживую: изолированный
+# вызов _scroll_until_enough_candidates обычно укладывается в один _SCROLL_WAIT_MS и честно
+# доскролливает до max_groups, но в реальном цикле кампании (2026-08-21, max_groups=40)
+# застревало на первой порции в 20 — VK иногда не успевает дорендерить следующую порцию за
+# 1500мс, и это ошибочно принималось за "выдача кончилась". Требуем NO_GROWTH_STALLS_TO_STOP
+# подряд пустых попыток (т.е. одну лишнюю паузу VK на "подумать"), прежде чем сдаться по-настоящему.
+_NO_GROWTH_STALLS_TO_STOP = 2
 _GROUP_LINK_SELECTOR = "a.vkuiAvatar__host"
 _GROUP_TITLE_SELECTOR = '[class*="vkuiHeadline"]'  # компонент не рендерит "__host", только "__level*"/"__density*"
 _CAPTCHA_SELECTOR = "div.captcha, form[action*='captcha']"
@@ -40,7 +51,7 @@ class VkParserAdapter:
         self,
         keyword: str,
         filters: ParseFilters,
-        on_progress: Callable[[int, int], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
         leads: list[RawLead] = []
         with sync_playwright() as pw:
@@ -61,6 +72,9 @@ class VkParserAdapter:
                 except PlaywrightTimeoutError:
                     pass  # ни одной группы по запросу — не ошибка, просто пустой результат
 
+                if filters.max_groups is not None:
+                    self._scroll_until_enough_candidates(page, filters.max_groups)
+
                 candidates = [
                     lead
                     for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
@@ -73,14 +87,14 @@ class VkParserAdapter:
                 want_site = filters.has_site is True
                 total = len(candidates)
                 if on_progress is not None:
-                    on_progress(0, total)
+                    on_progress(0, total, 0)
                 for checked, lead in enumerate(candidates, start=1):
                     has_site = self._has_external_site(page, lead.group_url)
                     if has_site == want_site:
                         leads.append(lead)
                         self._sleep_random()
                     if on_progress is not None:
-                        on_progress(checked, total)
+                        on_progress(checked, total, len(leads))
                     if filters.max_groups is not None and len(leads) >= filters.max_groups:
                         break  # набрали нужное количество — дальше кандидатов не проверяем
             finally:
@@ -88,13 +102,32 @@ class VkParserAdapter:
                 browser.close()
         return leads
 
+    def _scroll_until_enough_candidates(self, page: Page, max_groups: int) -> None:
+        # want минимум max_groups карточек в DOM, чтобы дальше было из чего проверять "есть
+        # сайт" — без этого candidates обрывался на первой подгруженной VK порции (~20).
+        loaded = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+        stalls = 0
+        for _ in range(_MAX_SCROLL_ATTEMPTS):
+            if loaded >= max_groups:
+                return
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(_SCROLL_WAIT_MS)
+            current = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+            if current == loaded:
+                stalls += 1
+                if stalls >= _NO_GROWTH_STALLS_TO_STOP:
+                    return  # несколько попыток подряд без роста — выдача действительно кончилась
+                continue
+            stalls = 0
+            loaded = current
+
     def _has_external_site(self, page: Page, group_url: str) -> bool:
         # Лишний реальный переход на страницу каждого кандидата — дороже по времени и риску
         # антибана, чем просто разбор карточек поиска, но иначе сайт не проверить: в самой
         # выдаче поиска домен нигде не показывается.
         try:
             page.goto(group_url, wait_until="domcontentloaded")
-            page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=15_000)
+            page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             return False  # поле не появилось за разумное время — у группы просто нет сайта
         except Exception:

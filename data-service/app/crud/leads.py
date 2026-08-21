@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -18,10 +18,34 @@ def bulk_insert(db: Session, leads: list[LeadCreate]) -> LeadBulkResult:
         pg_insert(Lead)
         .values(values)
         .on_conflict_do_nothing(index_elements=["platform", "external_id"])
-        .returning(Lead.id)
+        .returning(Lead.id, Lead.platform, Lead.external_id)
     )
     result = db.execute(stmt)
-    inserted_ids = [row[0] for row in result.fetchall()]
+    inserted_rows = result.fetchall()
+    inserted_ids = [row.id for row in inserted_rows]
+    inserted_keys = {(row.platform, row.external_id) for row in inserted_rows}
+
+    # Лиды, уже существующие в базе (например, найдены раньше кампанией, которую потом удалили —
+    # при удалении campaign_id у её лидов зануляется, см. Lead.campaign_id ondelete=SET NULL),
+    # при повторном обнаружении текущей кампанией нужно перепривязать к ней. Иначе такой лид
+    # молча "теряется": on_conflict_do_nothing его пропускает, он остаётся ничьим и не появляется
+    # в списке лидов кампании, хотя парсер только что нашёл его снова. Перепривязываем только
+    # если лид сейчас ничей (campaign_id IS NULL) — не отбираем лиды у чужой активной кампании.
+    for value in values:
+        campaign_id = value.get("campaign_id")
+        key = (value["platform"], value["external_id"])
+        if campaign_id is None or key in inserted_keys:
+            continue
+        db.execute(
+            update(Lead)
+            .where(
+                Lead.platform == key[0],
+                Lead.external_id == key[1],
+                Lead.campaign_id.is_(None),
+            )
+            .values(campaign_id=campaign_id)
+        )
+
     db.commit()
 
     return LeadBulkResult(

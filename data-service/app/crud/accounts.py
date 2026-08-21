@@ -19,6 +19,21 @@ def create_account(db: Session, account: AccountCreate) -> Account:
     return db_account
 
 
+def _effective_status(account: Account) -> str:
+    # status в БД зануляется лениво — только когда аккаунт реально забирают следующим
+    # next_available() (см. там же). До этого момента "cooldown"/"locked" с прошедшим
+    # until в БД так и остаётся, хотя аккаунт уже доступен. Без этой поправки API отдаёт
+    # заведомо устаревший статус (например, в панели пауза "висит" вечно, хотя таймер
+    # обратного отсчёта уже дошёл до нуля) — здесь просто отражаем то же условие
+    # доступности, что уже используется в next_available(), для отображения.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # cooldown_until/locked_until в БД — naive UTC
+    if account.status == "cooldown" and account.cooldown_until is not None and account.cooldown_until < now:
+        return "active"
+    if account.status == "locked" and account.locked_until is not None and account.locked_until < now:
+        return "active"
+    return account.status
+
+
 def _to_out(account: Account, hourly_used: int, daily_used: int, has_session: bool) -> AccountOut:
     return AccountOut(
         id=account.id,
@@ -30,7 +45,7 @@ def _to_out(account: Account, hourly_used: int, daily_used: int, has_session: bo
         viewport=account.viewport,
         hourly_limit=account.hourly_limit,
         daily_limit=account.daily_limit,
-        status=account.status,
+        status=_effective_status(account),
         warmup_stage=account.warmup_stage,
         cooldown_until=account.cooldown_until,
         locked_until=account.locked_until,
@@ -79,6 +94,7 @@ def next_available(
         .where(
             (Account.status == "active")
             | ((Account.status == "locked") & (Account.locked_until < now))
+            | ((Account.status == "cooldown") & (Account.cooldown_until < now))
         )
         .order_by(Account.warmup_stage, Account.last_used_at.asc().nulls_first())
         .limit(20)

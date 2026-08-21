@@ -19,5 +19,6 @@ class CampaignStatusOut(BaseModel):
     campaign: dict
     phase: str
     error: str | None = None
+    note: str | None = None
     stats: dict[str, int]
     progress: dict | None = None

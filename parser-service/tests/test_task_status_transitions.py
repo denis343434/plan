@@ -104,7 +104,7 @@ def test_captcha_cooldowns_account_and_does_not_release_it(monkeypatch):
     )
 
     class _CaptchaAdapter:
-        def search_communities(self, keyword, filters):
+        def search_communities(self, keyword, filters, on_progress=None):
             raise CaptchaDetectedError("captcha detected", partial_leads=[])
 
     monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _CaptchaAdapter())

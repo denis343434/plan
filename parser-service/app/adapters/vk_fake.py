@@ -16,7 +16,7 @@ class FakeVkAdapter:
         self,
         keyword: str,
         filters: ParseFilters,
-        on_progress: Callable[[int, int], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
         count = 3 if filters.max_groups is None else min(3, filters.max_groups)
         leads = [
@@ -28,7 +28,8 @@ class FakeVkAdapter:
             for i in range(count)
         ]
         if on_progress is not None:
-            for checked in range(len(leads) + 1):
-                on_progress(checked, len(leads))
+            on_progress(0, len(leads), 0)
+            for checked in range(1, len(leads) + 1):
+                on_progress(checked, len(leads), checked)
                 time.sleep(0.1)  # имитация прогресса, чтобы прогресс-бар в UI был виден и в fake-режиме
         return leads

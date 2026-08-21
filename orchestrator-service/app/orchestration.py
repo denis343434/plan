@@ -34,6 +34,9 @@ class OrchestrationTask:
     campaign_id: uuid.UUID
     phase: OrchestrationPhase = OrchestrationPhase.idle
     error: str | None = None
+    # Необязательное информационное сообщение (в отличие от error — не признак сбоя, просто
+    # пояснение к финальному состоянию, например почему рассылка не запускалась).
+    note: str | None = None
     # Живой прогресс текущей фазы (parsing: {"checked": N, "total": M} из Parser Service;
     # messaging: {"sent": N, "failed": M, "skipped": K} из Messaging Service) — обновляется
     # на каждом опросе _poll(), видно через GET /campaigns/{id} ещё до завершения фазы.
@@ -84,6 +87,15 @@ def run_campaign_flow(campaign_id: uuid.UUID, max_groups: int | None = None) -> 
             _finish_with_problem(data_client, task, outcome, f"parser: {last_status.get('error') or last_status.get('status')}")
             return
 
+        if not _has_template(data_client, campaign_id, campaign):
+            # Без шаблона рассылать нечего — раньше это доходило до Messaging Service и
+            # падало там ошибкой "no template configured for campaign", помечая кампанию как
+            # сбойную. Теперь это ожидаемый исход: кампания завершается на одном парсинге.
+            task.phase = OrchestrationPhase.done
+            task.note = "шаблон сообщения не задан — рассылка пропущена, кампания завершена только парсингом"
+            data_client.update_campaign_status(campaign_id, "completed")
+            return
+
         task.phase = OrchestrationPhase.messaging
         task.progress = None
         messaging_client.start_send(campaign_id)
@@ -109,6 +121,16 @@ def run_campaign_flow(campaign_id: uuid.UUID, max_groups: int | None = None) -> 
         data_client.close()
         parser_client.close()
         messaging_client.close()
+
+
+def _has_template(data_client: DataServiceClient, campaign_id: uuid.UUID, campaign: dict) -> bool:
+    # Та же логика выбора шаблона, что и в Messaging Service (_resolve_templates) — держим
+    # её здесь тоже, чтобы решение "запускать ли рассылку" принималось до старта фазы messaging,
+    # а не после падения там.
+    if campaign.get("template_id"):
+        return True
+    templates = data_client.list_templates()
+    return any(t.get("campaign_id") == str(campaign_id) for t in templates)
 
 
 def _finish_with_problem(

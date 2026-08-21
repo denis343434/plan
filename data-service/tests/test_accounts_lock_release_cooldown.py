@@ -39,6 +39,10 @@ def test_next_available_release_cycle(client: TestClient) -> None:
 
 
 def test_cooldown_expires_and_account_becomes_available(client: TestClient) -> None:
+    """Регрессия: next_available() раньше проверял автоистечение только для status='locked',
+    а cooldown с прошедшим cooldown_until так и оставался недоступен навсегда, пока кто-то
+    не позвал activate() руками (см. VK_PARSE_COOLDOWN_MIN в parser-service — с ним это стало
+    обычным сценарием каждые 5 минут, а не редким edge case)."""
     account_id = _create_account(client, "acc-cooldown")
 
     resp = client.post(f"/accounts/{account_id}/cooldown", json={"minutes": 30})
@@ -53,9 +57,13 @@ def test_cooldown_expires_and_account_becomes_available(client: TestClient) -> N
     past = datetime.now(timezone.utc) - timedelta(minutes=1)
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE accounts SET status='active', cooldown_until=:t WHERE id=:id"),
+            text("UPDATE accounts SET cooldown_until=:t WHERE id=:id"),
             {"t": past, "id": account_id},
         )
+
+    # Статус в БД по-прежнему 'cooldown' (никто его не менял) — только истекший cooldown_until.
+    still_shows_cooldown = client.get(f"/accounts?platform=vk").json()
+    assert next(a for a in still_shows_cooldown if a["id"] == account_id)["status"] == "active"
 
     available = client.post("/accounts/next-available", json={"platform": "vk", "purpose": "messaging"})
     assert available.status_code == 200

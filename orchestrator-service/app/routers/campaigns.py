@@ -53,6 +53,7 @@ def get_campaign_status(campaign_id: UUID) -> CampaignStatusOut:
     task = get_task(campaign_id)
     phase = task.phase if task is not None else OrchestrationPhase.idle
     error = task.error if task is not None else None
+    note = task.note if task is not None else None
     progress = task.progress if task is not None else None
 
-    return CampaignStatusOut(campaign=campaign, phase=phase, error=error, stats=stats, progress=progress)
+    return CampaignStatusOut(campaign=campaign, phase=phase, error=error, note=note, stats=stats, progress=progress)

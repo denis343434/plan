@@ -105,6 +105,11 @@ def test_start_campaign_runs_flow_to_done_and_status_endpoint_reflects_it():
             200, json={"task_id": task_id, "status": "done", "found": 1, "inserted": 1, "skipped": 0, "error": None}
         )
     )
+    respx.get(f"{DATA_BASE}/templates").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": str(uuid.uuid4()), "campaign_id": campaign_id, "variant": "A", "body": "hi"}]
+        )
+    )
     respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send").mock(
         return_value=httpx.Response(
             202, json={"campaign_id": campaign_id, "status": "queued", "sent": 0, "failed": 0, "skipped": 0, "error": None}

@@ -15,6 +15,7 @@ import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -126,12 +127,19 @@ class App(tk.Tk):
 
         self.selected_campaign_id: str | None = None
         self.detail_after_id: str | None = None
+        # Счётчики поколений для дедупликации периодических опросов (см. run_bg) — без этого
+        # более медленный старый запрос может прилететь после нового и откатить таблицу назад.
+        self._bg_gen: dict[str, int] = {}
+        # Последний загруженный /accounts по id — используется секундным тиком (см.
+        # _tick_account_cooldowns) для отсчёта кулдауна без похода в сеть на каждую секунду.
+        self._accounts_cache: dict[str, dict] = {}
 
         self._build_layout()
         self._schedule_list_refresh()
         self.refresh_health()
         self.refresh_accounts()
         self.refresh_campaigns()
+        self._tick_account_cooldowns()
 
     # ---------- layout ----------
     def _build_layout(self) -> None:
@@ -180,7 +188,7 @@ class App(tk.Tk):
         ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_account).grid(row=0, column=4, padx=4)
         self._placeholder(self.acc_login, "логин")
 
-        cols = ("login", "purpose", "status", "session", "usage")
+        cols = ("login", "purpose", "status", "session", "usage", "cooldown")
         self.acc_tree = ttk.Treeview(panel, columns=cols, show="headings", height=6)
         for col, title, width in (
             ("login", "Логин", 130),
@@ -188,6 +196,7 @@ class App(tk.Tk):
             ("status", "Статус", 90),
             ("session", "Вход в VK", 90),
             ("usage", "Нагрузка", 130),
+            ("cooldown", "Кулдаун", 80),
         ):
             self.acc_tree.heading(col, text=title)
             self.acc_tree.column(col, width=width, anchor="w")
@@ -249,6 +258,7 @@ class App(tk.Tk):
         self.max_groups_entry.pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Запустить", style="Accent.TButton", command=self.on_start_campaign).pack(side="left", padx=2)
         ttk.Button(btns, text="Обновить", command=self.refresh_detail).pack(side="left", padx=2)
+        ttk.Button(btns, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(side="left", padx=2)
 
         self.detail_status = ttk.Label(panel, text="", foreground="#555")
         self.detail_status.pack(fill="x", pady=(6, 2))
@@ -308,15 +318,27 @@ class App(tk.Tk):
         return "" if text == getattr(entry, "_placeholder_text", None) else text
 
     # ---------- async helper ----------
-    def run_bg(self, fn, on_done=None, on_error=None) -> None:
+    def run_bg(self, fn, on_done=None, on_error=None, dedupe_key: str | None = None) -> None:
+        # dedupe_key нужен для периодических опросов одного и того же эндпоинта: запросы
+        # уходят в отдельных потоках и могут завершиться в любом порядке, поэтому без проверки
+        # "я всё ещё последний выпущенный запрос с этим ключом" более старый, но медленный ответ
+        # мог прилететь позже нового и молча откатить UI на устаревшие данные.
+        gen = None
+        if dedupe_key is not None:
+            gen = self._bg_gen.get(dedupe_key, 0) + 1
+            self._bg_gen[dedupe_key] = gen
+
+        def is_current() -> bool:
+            return dedupe_key is None or self._bg_gen.get(dedupe_key) == gen
+
         def worker() -> None:
             try:
                 result = fn()
             except Exception as exc:  # noqa: BLE001 - показываем любую ошибку пользователю
-                if on_error:
+                if on_error and is_current():
                     self.after(0, lambda: on_error(exc))
                 return
-            if on_done:
+            if on_done and is_current():
                 self.after(0, lambda: on_done(result))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -342,14 +364,35 @@ class App(tk.Tk):
             for name, ok in results:
                 self.health_dots[name].configure(foreground="#2e9e4f" if ok else "#c0392b")
 
-        self.run_bg(check_all, on_done=done)
+        self.run_bg(check_all, on_done=done, dedupe_key="health")
 
     # ---------- accounts ----------
+    @staticmethod
+    def _cooldown_text(account: dict) -> str:
+        # cooldown_until (или locked_until — во время самого цикла парсинга/рассылки) отдаётся
+        # Data Service как naive UTC ISO-строка (см. Account.cooldown_until в data-service) —
+        # datetime.now(timezone.utc) на клиенте и сравниваем с ним напрямую как UTC.
+        until_raw = account.get("cooldown_until") or account.get("locked_until")
+        if not until_raw:
+            return "-"
+        try:
+            until_dt = datetime.fromisoformat(until_raw.replace("Z", "+00:00"))
+        except ValueError:
+            return "-"
+        if until_dt.tzinfo is None:
+            until_dt = until_dt.replace(tzinfo=timezone.utc)
+        remaining = int((until_dt - datetime.now(timezone.utc)).total_seconds())
+        if remaining <= 0:
+            return "-"
+        minutes, seconds = divmod(remaining, 60)
+        return f"{minutes}:{seconds:02d}"
+
     def refresh_accounts(self) -> None:
         def fetch():
             return api_request(DATA_URL, "/accounts")
 
         def done(accounts):
+            self._accounts_cache = {a["id"]: a for a in accounts}
             self.acc_tree.delete(*self.acc_tree.get_children())
             for a in accounts:
                 usage = f"{a['hourly_used']}/{a['hourly_limit']} ч · {a['daily_used']}/{a['daily_limit']} сут"
@@ -357,14 +400,27 @@ class App(tk.Tk):
                 session_text = "есть" if has_session else "нет входа"
                 self.acc_tree.insert(
                     "", "end", iid=a["id"],
-                    values=(a["login"], RU_PURPOSE.get(a["purpose"], a["purpose"]), RU_ACCOUNT_STATUS.get(a["status"], a["status"]), session_text, usage),
+                    values=(
+                        a["login"], RU_PURPOSE.get(a["purpose"], a["purpose"]),
+                        RU_ACCOUNT_STATUS.get(a["status"], a["status"]), session_text, usage,
+                        self._cooldown_text(a),
+                    ),
                     tags=("has_session" if has_session else "no_session",),
                 )
 
         def error(exc):
             self.flash_status(f"Не удалось загрузить аккаунты: {exc}", is_err=True)
 
-        self.run_bg(fetch, on_done=done, on_error=error)
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="accounts")
+
+    def _tick_account_cooldowns(self) -> None:
+        # Отдельный секундный тик поверх обычного refresh_accounts (раз в REFRESH_LIST_MS) —
+        # без него счётчик дёргался бы раз в 8 секунд рывками вместо плавного обратного отсчёта.
+        # Считает по локально закэшированным данным, без похода в сеть.
+        for account_id, account in self._accounts_cache.items():
+            if self.acc_tree.exists(account_id):
+                self.acc_tree.set(account_id, "cooldown", self._cooldown_text(account))
+        self.after(1000, self._tick_account_cooldowns)
 
     def on_create_account(self) -> None:
         payload = {
@@ -528,7 +584,7 @@ class App(tk.Tk):
         def error(exc):
             self.flash_status(f"Не удалось загрузить кампании: {exc}", is_err=True)
 
-        self.run_bg(fetch, on_done=done, on_error=error)
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="campaigns")
 
     def on_create_campaign(self) -> None:
         payload = {
@@ -667,13 +723,15 @@ class App(tk.Tk):
             status_text = f"фаза: {RU_PHASE.get(data['phase'], data['phase'])} · статус кампании: {RU_CAMPAIGN_STATUS.get(data['campaign']['status'], data['campaign']['status'])}"
             if data.get("error"):
                 status_text += f" · ошибка: {data['error']}"
+            elif data.get("note"):
+                status_text += f" · {data['note']}"
             self.detail_status.configure(text=status_text, foreground="#c0392b" if data.get("error") else "#555")
             self._update_progress(data.get("phase"), data.get("progress"))
 
         def error(exc):
             self.detail_status.configure(text=f"Ошибка загрузки статуса: {exc}", foreground="#c0392b")
 
-        self.run_bg(fetch, on_done=done, on_error=error)
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="detail_status")
         self.refresh_leads()
         self.refresh_templates()
 
@@ -722,7 +780,7 @@ class App(tk.Tk):
                     values=(lead.get("title") or "", lead.get("group_url") or "", RU_LEAD_STATUS.get(lead["status"], lead["status"])),
                 )
 
-        self.run_bg(fetch, on_done=done)
+        self.run_bg(fetch, on_done=done, dedupe_key="leads")
 
     def refresh_templates(self) -> None:
         campaign_id = self.selected_campaign_id
@@ -739,7 +797,7 @@ class App(tk.Tk):
             text = "сохранено: " + " · ".join(f'{t["variant"]} — "{t["body"]}"' for t in own) if own else "шаблонов пока нет"
             self.tpl_list_label.configure(text=text)
 
-        self.run_bg(fetch, on_done=done)
+        self.run_bg(fetch, on_done=done, dedupe_key="templates")
 
     def on_save_template(self) -> None:
         if not self.selected_campaign_id:

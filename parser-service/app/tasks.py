@@ -6,6 +6,7 @@ from enum import StrEnum
 from app.adapters.base import CaptchaDetectedError, ParseFilters
 from app.adapters.registry import get_adapter
 from app.clients.data_service import DataServiceClient
+from app.config import settings
 from app.exceptions import DataServiceError, NoAccountAvailableError
 from app.schemas.parse import ParseFiltersSchema
 
@@ -82,7 +83,7 @@ def run_parse_task(
         else:
             adapter = get_adapter(platform)
 
-        def on_progress(checked: int, total: int) -> None:
+        def on_progress(checked: int, total: int, found: int) -> None:
             task.progress_checked = checked
             task.progress_total = total
 
@@ -113,9 +114,18 @@ def run_parse_task(
     finally:
         if account_id is not None and not cooled_down:
             try:
-                client.release_account(account_id)
+                if platform == "vk" and settings.VK_ADAPTER_MODE == "playwright":
+                    # Реальный цикл против VK уже состоялся (next_available_account/get_session
+                    # прошли) — обычный release() тут же вернул бы аккаунт в active и следующий
+                    # запуск (например, повторный клик "Запустить" в панели) забрал бы его снова
+                    # без паузы. cooldown() вместо release — см. VK_PARSE_COOLDOWN_MIN в config.py.
+                    client.cooldown_account(
+                        account_id, minutes=settings.VK_PARSE_COOLDOWN_MIN, reason="routine_parse_cooldown"
+                    )
+                else:
+                    client.release_account(account_id)
             except DataServiceError:
-                logger.exception("failed to release account %s", account_id)
+                logger.exception("failed to release/cooldown account %s", account_id)
         client.close()
 
 

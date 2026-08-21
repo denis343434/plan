@@ -31,6 +31,15 @@ def _send_status(campaign_id: str, status: str, error: str | None = None) -> dic
     return {"campaign_id": campaign_id, "status": status, "sent": 0, "failed": 0, "skipped": 0, "error": error}
 
 
+def _mock_template(campaign_id: str) -> None:
+    respx.get(f"{DATA_BASE}/templates").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"id": str(uuid.uuid4()), "campaign_id": campaign_id, "variant": "A", "body": "hi"}],
+        )
+    )
+
+
 @respx.mock
 def test_flow_completes_through_parsing_and_messaging():
     campaign_id = str(uuid.uuid4())
@@ -48,6 +57,7 @@ def test_flow_completes_through_parsing_and_messaging():
     respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
         return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
     )
+    _mock_template(campaign_id)
     respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send").mock(
         return_value=httpx.Response(202, json=_send_status(campaign_id, "queued"))
     )
@@ -60,6 +70,36 @@ def test_flow_completes_through_parsing_and_messaging():
 
     assert task.phase == OrchestrationPhase.done
     assert task.error is None
+    assert patch_route.call_count == 2  # running, then completed
+
+
+@respx.mock
+def test_flow_skips_messaging_when_no_template_configured():
+    campaign_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+
+    respx.get(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id))
+    )
+    patch_route = respx.patch(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, status="completed"))
+    )
+    respx.post(f"{PARSER_BASE}/parse").mock(
+        return_value=httpx.Response(202, json=_parse_status(task_id, "queued"))
+    )
+    respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
+        return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
+    )
+    respx.get(f"{DATA_BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    send_route = respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send")
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_campaign_flow(uuid.UUID(campaign_id))
+
+    assert task.phase == OrchestrationPhase.done
+    assert task.error is None
+    assert task.note and "шаблон" in task.note
+    assert not send_route.called
     assert patch_route.call_count == 2  # running, then completed
 
 
@@ -106,6 +146,7 @@ def test_flow_stops_when_messaging_waits_for_account():
     respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
         return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
     )
+    _mock_template(campaign_id)
     respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send").mock(
         return_value=httpx.Response(202, json=_send_status(campaign_id, "queued"))
     )

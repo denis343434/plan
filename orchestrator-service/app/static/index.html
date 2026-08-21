@@ -381,7 +381,7 @@ async function refreshDetail() {
     `).join('');
     document.getElementById('detailStatus').innerHTML =
       `фаза: ${badge(data.phase, RU_PHASE)} · статус кампании: ${badge(data.campaign.status, RU_CAMPAIGN_STATUS)}` +
-      (data.error ? ` · <span style="color:var(--err)">ошибка: ${data.error}</span>` : '');
+      (data.error ? ` · <span style="color:var(--err)">ошибка: ${data.error}</span>` : (data.note ? ` · ${data.note}` : ''));
   } catch (e) {
     document.getElementById('detailStatus').textContent = 'Ошибка загрузки статуса: ' + e.message;
   }

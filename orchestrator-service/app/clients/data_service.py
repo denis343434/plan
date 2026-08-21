@@ -50,6 +50,9 @@ class DataServiceClient:
         params = {"campaign_id": str(campaign_id), "status": status, "limit": limit}
         return self._request("GET", "/leads", params=params).json()
 
+    def list_templates(self) -> list[dict]:
+        return self._request("GET", "/templates").json()
+
     def cooldown_account(
         self, account_id: UUID | str, minutes: int, reason: str | None = None, permanent: bool = False
     ) -> dict:

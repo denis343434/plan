@@ -40,6 +40,7 @@ services:
       VK_HEADLESS: ${VK_HEADLESS:-true}
       MIN_DELAY_SEC: ${MIN_DELAY_SEC:-1.0}
       MAX_DELAY_SEC: ${MAX_DELAY_SEC:-3.0}
+      VK_PARSE_COOLDOWN_MIN: ${VK_PARSE_COOLDOWN_MIN:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       - data-service

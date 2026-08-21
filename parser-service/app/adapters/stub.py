@@ -20,9 +20,9 @@ class NotImplementedAdapter:
         self,
         keyword: str,
         filters: ParseFilters,
-        on_progress: Callable[[int, int], None] | None = None,
+        on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
         logger.info("platform %s not supported yet", self._platform)
         if on_progress is not None:
-            on_progress(0, 0)
+            on_progress(0, 0, 0)
         return []
