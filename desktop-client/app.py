@@ -18,7 +18,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 # Локальный "гейт" перед панелью — не серьёзная аутентификация (сами API Data/Parser/
 # Messaging/Orchestrator по-прежнему открыты на localhost без какой-либо проверки), а просто
@@ -145,15 +145,22 @@ class App(tk.Tk):
         # поднимал уже открытое окно, а не плодил дубликаты.
         self._messages_win: tk.Toplevel | None = None
         self._messages_tree: ttk.Treeview | None = None
+        self._message_reply_text: scrolledtext.ScrolledText | None = None
         # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
         # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
         self._message_links: dict[str, str] = {}
+        # message_id -> полный текст ответа (в таблице колонка "Текст ответа" всё равно обрежется
+        # по ширине ячейки — полный текст показываем в textarea под таблицей по выбору строки).
+        self._message_reply_texts: dict[str, str] = {}
         # логин -> account_id для комбобокса выбора аккаунта в окне "Кому написали"
         # (проверка входящих запускается за конкретный аккаунт — своя переписка/сессия).
         self._account_id_by_login: dict[str, str] = {}
         # account_id, для которого сейчас идёт фоновая проверка входящих (см. _poll_inbox_check) —
         # None, когда проверка не запущена; не даёт запустить вторую поверх идущей.
         self._inbox_check_account_id: str | None = None
+        # campaign_id, для которой сейчас идёт повторная рассылка по ошибкам (см.
+        # _poll_retry_send) — None, когда не запущена; не даёт запустить вторую поверх идущей.
+        self._retry_send_campaign_id: str | None = None
 
         self._install_clipboard_shortcuts()
         self._build_layout()
@@ -305,6 +312,7 @@ class App(tk.Tk):
         self.max_groups_entry.insert(0, "20")
         self.max_groups_entry.pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Запустить", style="Accent.TButton", command=self.on_start_campaign).pack(side="left", padx=2)
+        ttk.Button(btns, text="Повторить с ошибками", command=self.on_retry_failed_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Обновить", command=self.refresh_detail).pack(side="left", padx=2)
         ttk.Button(btns, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(side="left", padx=2)
 
@@ -756,6 +764,85 @@ class App(tk.Tk):
 
         self.run_bg(start, on_done=done, on_error=error)
 
+    def on_retry_failed_send(self) -> None:
+        if not self.selected_campaign_id:
+            return
+        campaign_id = self.selected_campaign_id
+        if self._retry_send_campaign_id is not None:
+            messagebox.showinfo("Рассылка", "Повторная рассылка уже идёт, дождитесь её окончания")
+            return
+
+        self._retry_send_campaign_id = campaign_id
+        self.detail_progress_bar.pack_forget()
+        self.detail_progress_label.configure(text="запускаю повторную рассылку…")
+
+        def start():
+            # Напрямую в Messaging Service, в обход Orchestrator — "Запустить" гоняет весь цикл
+            # заново (включая повторный парсинг), а нам нужно только повторить отправку.
+            # POST /campaigns/{id}/send рассылает всем лидам со status=new — туда как раз
+            # попадают лиды, у которых прошлая отправка провалилась без признаков флуда (см.
+            # messaging-service/app/tasks.py:_process_lead — такие лиды НЕ переводятся в
+            # "contacted", остаются "new" именно для повторной отправки), плюс любые ещё не
+            # тронутые лиды.
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send", method="POST")
+
+        def started(_result):
+            self.after(500, lambda: self._poll_retry_send(campaign_id))
+
+        def error(exc):
+            self._retry_send_campaign_id = None
+            self.detail_progress_label.configure(text="")
+            messagebox.showerror("Рассылка", str(exc))
+
+        self.run_bg(start, on_done=started, on_error=error)
+
+    def _poll_retry_send(self, campaign_id: str) -> None:
+        if campaign_id != self.selected_campaign_id:
+            self._retry_send_campaign_id = None
+            return
+
+        def fetch():
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send-status", timeout=15.0)
+
+        def done(result):
+            if campaign_id != self.selected_campaign_id:
+                self._retry_send_campaign_id = None
+                return
+            status = result["status"]
+            if status in ("queued", "running"):
+                self.detail_progress_label.configure(
+                    text=f"Повторная рассылка: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+                )
+                self.after(2000, lambda: self._poll_retry_send(campaign_id))
+                return
+
+            self._retry_send_campaign_id = None
+            if status == "failed":
+                self.detail_progress_label.configure(text="")
+                messagebox.showerror("Рассылка", result.get("error") or "не удалось повторить рассылку")
+                return
+            if status == "waiting_for_account":
+                self.detail_progress_label.configure(
+                    text=f"Повторная рассылка приостановлена: нет свободного аккаунта "
+                    f"(отправлено {result['sent']}, ошибок {result['failed']})"
+                )
+                self.flash_status("Повторная рассылка приостановлена: нет свободного аккаунта")
+                self.refresh_leads()
+                return
+
+            self.detail_progress_label.configure(
+                text=f"Повторная рассылка завершена: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+            )
+            self.flash_status(f"Повторная рассылка: отправлено {result['sent']}, ошибок {result['failed']}")
+            self.refresh_leads()
+
+        def error(exc):
+            self._retry_send_campaign_id = None
+            self.detail_progress_label.configure(text="")
+            messagebox.showerror("Рассылка", str(exc))
+
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="retry_send_status")
+
     def refresh_detail(self) -> None:
         if not self.selected_campaign_id:
             return
@@ -775,7 +862,11 @@ class App(tk.Tk):
             elif data.get("note"):
                 status_text += f" · {data['note']}"
             self.detail_status.configure(text=status_text, foreground="#c0392b" if data.get("error") else "#555")
-            self._update_progress(data.get("phase"), data.get("progress"))
+            if self._retry_send_campaign_id != campaign_id:
+                # Пока идёт своя повторная рассылка (см. _poll_retry_send) — Orchestrator о ней
+                # не знает (её запускают напрямую в Messaging Service в обход него) и покажет
+                # тут устаревший/пустой прогресс, затирая наш. Не даём ему это делать.
+                self._update_progress(data.get("phase"), data.get("progress"))
 
         def error(exc):
             self.detail_status.configure(text=f"Ошибка загрузки статуса: {exc}", foreground="#c0392b")
@@ -889,8 +980,8 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Кому написали")
-        win.geometry("1180x520")
-        win.minsize(900, 340)
+        win.geometry("1180x640")
+        win.minsize(900, 420)
         self._messages_win = win
 
         top = ttk.Frame(win, padding=(10, 10, 10, 4))
@@ -925,9 +1016,18 @@ class App(tk.Tk):
         tree.tag_configure("sent", foreground="#2e9e4f")
         tree.tag_configure("failed", foreground="#c0392b")
         tree.tag_configure("replied", foreground="#2f5ad0")
-        tree.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        tree.pack(fill="both", expand=True, padx=10, pady=(4, 4))
         tree.bind("<Double-1>", lambda _event: self._open_selected_message_link())
+        tree.bind("<<TreeviewSelect>>", lambda _event: self._on_message_row_selected())
         self._messages_tree = tree
+
+        reply_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
+        reply_frame.pack(fill="x")
+        ttk.Label(reply_frame, text="Текст ответа:").pack(anchor="w")
+        reply_text = scrolledtext.ScrolledText(reply_frame, height=5, wrap="word")
+        reply_text.configure(state="disabled")
+        reply_text.pack(fill="x", pady=(2, 0))
+        self._message_reply_text = reply_text
 
         self._refresh_message_account_choices()
         self._load_messages()
@@ -954,6 +1054,7 @@ class App(tk.Tk):
 
             tree.delete(*tree.get_children())
             self._message_links = {}
+            self._message_reply_texts = {}
             for m in sorted(messages, key=lambda m: m["sent_at"], reverse=True):
                 lead = leads_by_id.get(m["lead_id"], {})
                 title = lead.get("title") or "-"
@@ -979,11 +1080,26 @@ class App(tk.Tk):
                     tags=(tag,),
                 )
                 self._message_links[m["id"]] = group_url
+                self._message_reply_texts[m["id"]] = m.get("reply_preview") or ""
+
+            self._on_message_row_selected()
 
         def error(exc):
             self.flash_status(f"Не удалось загрузить сообщения: {exc}", is_err=True)
 
         self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="messages")
+
+    def _on_message_row_selected(self) -> None:
+        tree = self._messages_tree
+        reply_text = self._message_reply_text
+        if tree is None or reply_text is None or not reply_text.winfo_exists():
+            return
+        selected = tree.selection()
+        text = self._message_reply_texts.get(selected[0], "") if selected else ""
+        reply_text.configure(state="normal")
+        reply_text.delete("1.0", "end")
+        reply_text.insert("1.0", text)
+        reply_text.configure(state="disabled")
 
     def _open_selected_message_link(self) -> None:
         tree = self._messages_tree
