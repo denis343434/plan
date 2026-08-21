@@ -155,12 +155,38 @@ class App(tk.Tk):
         # None, когда проверка не запущена; не даёт запустить вторую поверх идущей.
         self._inbox_check_account_id: str | None = None
 
+        self._install_clipboard_shortcuts()
         self._build_layout()
         self._schedule_list_refresh()
         self.refresh_health()
         self.refresh_accounts()
         self.refresh_campaigns()
         self._tick_account_cooldowns()
+
+    def _install_clipboard_shortcuts(self) -> None:
+        # Стандартные Tk-биндинги <<Paste>>/<<Copy>>/<<Cut>> завязаны на keysym "v"/"c"/"x" —
+        # на русской раскладке Windows физическая клавиша V/C/X даёт другой keysym, и Ctrl+V
+        # молча ничего не делает ни в одном Entry/Text приложения. keycode — это код физической
+        # клавиши, он не зависит от раскладки, поэтому дублируем действия через него.
+        actions = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+
+        def on_control_key(event: tk.Event) -> str | None:
+            action = actions.get(event.keycode)
+            if action is None or not (event.state & 0x4):
+                return None
+            widget = event.widget
+            if not isinstance(widget, (tk.Entry, tk.Text)):
+                return None
+            if action == "<<SelectAll>>":
+                if isinstance(widget, tk.Text):
+                    widget.tag_add("sel", "1.0", "end")
+                else:
+                    widget.selection_range(0, "end")
+            else:
+                widget.event_generate(action)
+            return "break"
+
+        self.bind_all("<Control-KeyPress>", on_control_key, add="+")
 
     # ---------- layout ----------
     def _build_layout(self) -> None:
