@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+# Локальный "гейт" перед панелью — не серьёзная аутентификация (сами API Data/Parser/
+# Messaging/Orchestrator по-прежнему открыты на localhost без какой-либо проверки), а просто
+# экран входа, чтобы окно не открывалось сразу для кого угодно за компьютером.
+USERS = {"denis": "Password", "alexiy": "Password"}
+
 HOST = "localhost"
 DATA_URL = f"http://{HOST}:8001"
 PARSER_URL = f"http://{HOST}:8002"
@@ -970,5 +975,54 @@ class App(tk.Tk):
         self.run_bg(stop, on_done=done, on_error=error)
 
 
+def prompt_login() -> bool:
+    """Модальный экран входа. Возвращает True, если логин/пароль совпали с USERS,
+    False — если окно закрыли крестиком, не залогинившись."""
+    root = tk.Tk()
+    root.title("VK Lead-Gen — вход")
+    root.geometry("300x190")
+    root.resizable(False, False)
+    root.eval("tk::PlaceWindow . center")
+
+    logged_in = {"value": False}
+
+    frame = ttk.Frame(root, padding=20)
+    frame.pack(fill="both", expand=True)
+    frame.columnconfigure(1, weight=1)
+
+    ttk.Label(frame, text="VK Lead-Gen", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 12))
+
+    ttk.Label(frame, text="Логин:").grid(row=1, column=0, sticky="w", pady=4)
+    login_entry = ttk.Entry(frame)
+    login_entry.grid(row=1, column=1, sticky="ew", pady=4)
+
+    ttk.Label(frame, text="Пароль:").grid(row=2, column=0, sticky="w", pady=4)
+    password_entry = ttk.Entry(frame, show="*")
+    password_entry.grid(row=2, column=1, sticky="ew", pady=4)
+
+    error_label = ttk.Label(frame, text="", foreground="#c0392b")
+    error_label.grid(row=3, column=0, columnspan=2, pady=(4, 0))
+
+    def try_login(_event: object = None) -> None:
+        login = login_entry.get().strip()
+        password = password_entry.get()
+        if USERS.get(login) == password:
+            logged_in["value"] = True
+            root.destroy()
+        else:
+            error_label.configure(text="Неверный логин или пароль")
+            password_entry.delete(0, "end")
+            password_entry.focus_set()
+
+    ttk.Button(frame, text="Войти", command=try_login).grid(row=4, column=0, columnspan=2, pady=(14, 0), sticky="ew")
+    login_entry.bind("<Return>", try_login)
+    password_entry.bind("<Return>", try_login)
+    login_entry.focus_set()
+
+    root.mainloop()
+    return logged_in["value"]
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    if prompt_login():
+        App().mainloop()
