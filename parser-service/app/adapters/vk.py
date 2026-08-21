@@ -20,12 +20,30 @@ logger = logging.getLogger(__name__)
 _SITE_FIELD_SELECTOR = '[data-testid="group-info-site"]'
 _SITE_DOMAIN_PATTERN = re.compile(r"[a-zа-яё0-9][a-zа-яё0-9-]*\.[a-zа-яё]{2,}", re.IGNORECASE)
 
-_SEARCH_URL = "https://vk.com/search/communities?q={keyword}"
-
-# Проверено вживую 2026-08-20 через реальный залогиненный аккаунт: старые
-# "/search/groups?c[q]=" и SearchGroupsList__* — рудимент дореформенного VK, современный
-# поиск отдаёт 0 результатов по этому URL (поле поиска в шапке остаётся пустым). Актуальный
-# путь — /search/communities?q=, карточки — VKUI RichCell с data-testid="group_item_desktop_list".
+# Проверено вживую 2026-08-20: старые "/search/groups?c[q]=" и SearchGroupsList__* — рудимент
+# дореформенного VK, современный путь — /search/communities?q=.
+#
+# НО проверено вживую 2026-08-21 (парсинг кампании "Спортзал" молча вернул 0 групп): ПРЯМОЙ
+# заход (page.goto) на "https://vk.com/search/communities?q=..." (и то же самое на vk.ru)
+# сервер VK редиректит на битую legacy-страницу "/main.php?subdir=search&subsubdir=communities"
+# с title="Ошибка" и пустым телом — не таймаут, не капча, просто пустая страница, отсюда
+# "0 карточек" без единой ошибки в логах. Работает ТОЛЬКО переход изнутри уже загруженного
+# SPA: набрать запрос в строке поиска шапки (как живой пользователь, см. _open_communities_search)
+# и дойти до полного списка через блок "Сообщества" на странице общей выдачи → "Показать все".
+# Только после такого перехода страница реально показывает карточки — VKUI RichCell с
+# data-testid="group_item_desktop_list".
+_FEED_URL = "https://vk.ru/feed"
+_SEARCH_INPUT_SELECTOR = '[data-testid="search_top_input"]'
+_RESULT_HEADER_SELECTOR = '[data-testid="header"]'
+# Проверено вживую 2026-08-21: сразу после Enter в DOM ненадолго появляется лёгкая подсказка-
+# автокомплит ("Недавние", "Люди", "Сообщества" — без кнопки "Показать все", без реальных
+# карточек), и у неё ТОЖЕ есть заголовок с текстом "Сообщества" — ждать просто "заголовок с
+# 'Сообщества'" ловило именно эту подсказку вместо настоящих результатов (0 карточек вместо
+# 20+). Настоящая страница результатов приходит позже (~8-20с) и помечена заголовком
+# "Результаты поиска" — ждать нужно именно его, только потом искать секцию "Сообщества".
+_SEARCH_RESULTS_LABEL = "Результаты поиска"
+_COMMUNITIES_SECTION_LABEL = "Сообщества"
+_SHOW_ALL_SELECTOR = "text=Показать все"
 _GROUP_CARD_SELECTOR = '[data-testid="group_item_desktop_list"]'
 # Выдача VK подгружает карточки бесконечным скроллом порциями (~20 за раз) — без явного
 # докручивания в DOM всегда только первая порция, независимо от filters.max_groups.
@@ -59,13 +77,7 @@ class VkParserAdapter:
             context = browser.new_context(storage_state=self._storage_state or None)
             page = context.new_page()
             try:
-                # wait_until="load" (дефолт) у VK почти всегда упирается в таймаут: страница —
-                # тяжёлый SPA с фоновыми вебсокетами/long-polling (онлайн-статус, аналитика),
-                # из-за которых событие "load" может не наступить вовсе, хотя сам контент уже
-                # отрисован. "domcontentloaded" + явное ожидание карточек — надёжнее.
-                page.goto(_SEARCH_URL.format(keyword=keyword), wait_until="domcontentloaded")
-                self._sleep_random()
-                self._raise_if_captcha(page, leads)
+                self._open_communities_search(page, keyword, leads)
 
                 try:
                     page.wait_for_selector(_GROUP_CARD_SELECTOR, timeout=15_000)
@@ -101,6 +113,76 @@ class VkParserAdapter:
                 context.close()
                 browser.close()
         return leads
+
+    def _open_communities_search(self, page: Page, keyword: str, collected_so_far: list[RawLead]) -> None:
+        """Доводит page до выдачи сообществ по keyword — см. комментарий у _FEED_URL про то,
+        почему нельзя просто page.goto() на URL поиска напрямую.
+
+        Если по итогу карточек сообществ нет вовсе (ни одной в выдаче, либо секция
+        "Сообщества" отсутствует, либо результатов настолько мало, что VK не показал кнопку
+        "Показать все") — просто возвращаемся, вызывающий код (wait_for_selector на
+        _GROUP_CARD_SELECTOR) корректно обработает и пустую, и уже готовую выдачу.
+        """
+        # wait_until="load" (дефолт) у VK почти всегда упирается в таймаут: страница — тяжёлый
+        # SPA с фоновыми вебсокетами/long-polling (онлайн-статус, аналитика), из-за которых
+        # событие "load" может не наступить вовсе, хотя сам контент уже отрисован.
+        page.goto(_FEED_URL, wait_until="domcontentloaded")
+        try:
+            # Проверено вживую 2026-08-21: реальный контент VK в этом окружении иногда
+            # прогружается только через ~18-20с после domcontentloaded (страница до этого
+            # висит в скелетон-заглушке) — короткий таймаут тут стабильно ловил "не нашли".
+            search_input = page.wait_for_selector(_SEARCH_INPUT_SELECTOR, timeout=30_000)
+        except PlaywrightTimeoutError:
+            raise RuntimeError("VK не догрузился — строка поиска в шапке не появилась за 30с")
+        self._raise_if_captcha(page, collected_so_far)
+
+        search_input.click()
+        search_input.type(keyword, delay=random.uniform(30, 80))
+        self._sleep_random()
+        page.keyboard.press("Enter")
+
+        # Ждём именно "Результаты поиска" (см. комментарий у _SEARCH_RESULTS_LABEL) — маркер
+        # настоящей страницы результатов, а не мимолётной подсказки-автокомплита.
+        if not self._wait_for_header_containing(page, _SEARCH_RESULTS_LABEL, timeout=20_000):
+            return  # настоящая страница результатов не подгрузилась за 20с — 0 карточек
+        self._raise_if_captcha(page, collected_so_far)
+
+        # Секции результатов ("Сообщества", "Видео", ...) могут дорисовываться по одной уже
+        # ПОСЛЕ самого "Результаты поиска" — отдельное ожидание именно её, не полагаемся на то,
+        # что она уже в DOM к этому моменту.
+        if not self._wait_for_header_containing(page, _COMMUNITIES_SECTION_LABEL, timeout=10_000):
+            return  # секции "Сообщества" в выдаче нет вовсе — по запросу их точно 0
+
+        communities_header = None
+        for header in page.query_selector_all(_RESULT_HEADER_SELECTOR):
+            if _COMMUNITIES_SECTION_LABEL in (header.inner_text() or ""):
+                communities_header = header
+                break
+        if communities_header is None:
+            return  # не должно случиться после wait_for_header_containing выше, но не гадаем
+
+        show_all = communities_header.query_selector(_SHOW_ALL_SELECTOR)
+        if show_all is None:
+            return  # все найденные сообщества уже показаны прямо тут, докручивать некуда
+        show_all.click()
+        page.wait_for_timeout(1500)  # переход внутри SPA, не полная навигация — короткая пауза
+
+    def _wait_for_header_containing(self, page: Page, label: str, timeout: int) -> bool:
+        """True, если за timeout мс среди [data-testid="header"] появился хотя бы один с
+        текстом, содержащим label. False — не дождались (не гадаем, что это значит — решает
+        вызывающий код)."""
+        try:
+            page.wait_for_function(
+                """
+                (label) => Array.from(document.querySelectorAll('[data-testid="header"]'))
+                    .some((el) => el.textContent && el.textContent.includes(label))
+                """,
+                arg=label,
+                timeout=timeout,
+            )
+            return True
+        except PlaywrightTimeoutError:
+            return False
 
     def _scroll_until_enough_candidates(self, page: Page, max_groups: int) -> None:
         # want минимум max_groups карточек в DOM, чтобы дальше было из чего проверять "есть
