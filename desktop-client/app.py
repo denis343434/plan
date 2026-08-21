@@ -15,6 +15,7 @@ import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -76,6 +77,7 @@ RU_STATS_LABEL = {
     "replied": "ответили",
     "rejected": "отклонены",
 }
+RU_DELIVERY_STATUS = {"sent": "отправлено", "failed": "ошибка", "pending": "в очереди"}
 RU_PURPOSE_REVERSE = {v: k for k, v in RU_PURPOSE.items()}
 PLATFORM_LABELS = {"vk": "VK", "telegram": "Telegram", "instagram": "Instagram"}
 PLATFORM_REVERSE = {v: k for k, v in PLATFORM_LABELS.items()}
@@ -133,6 +135,13 @@ class App(tk.Tk):
         # Последний загруженный /accounts по id — используется секундным тиком (см.
         # _tick_account_cooldowns) для отсчёта кулдауна без похода в сеть на каждую секунду.
         self._accounts_cache: dict[str, dict] = {}
+        # Окно "Кому написали" — держим ссылку, чтобы повторный клик по кнопке в шапке
+        # поднимал уже открытое окно, а не плодил дубликаты.
+        self._messages_win: tk.Toplevel | None = None
+        self._messages_tree: ttk.Treeview | None = None
+        # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
+        # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
+        self._message_links: dict[str, str] = {}
 
         self._build_layout()
         self._schedule_list_refresh()
@@ -147,6 +156,7 @@ class App(tk.Tk):
         header.pack(fill="x")
         ttk.Label(header, text="VK Lead-Gen — панель управления", font=("Segoe UI", 13, "bold")).pack(side="left")
         ttk.Button(header, text="Остановить приложение", style="Danger.TButton", command=self.on_stop_app).pack(side="right", padx=(12, 0))
+        ttk.Button(header, text="Кому написали", command=self.open_messages_window).pack(side="right", padx=(12, 0))
         self.health_frame = ttk.Frame(header)
         self.health_frame.pack(side="right")
         self.health_dots: dict[str, ttk.Label] = {}
@@ -291,6 +301,7 @@ class App(tk.Tk):
             self.leads_tree.heading(col, text=title)
             self.leads_tree.column(col, width=width, anchor="w")
         self.leads_tree.pack(fill="both", expand=True, pady=(4, 0))
+        self.leads_tree.bind("<Double-1>", self._on_lead_row_double_click)
         return panel
 
     @staticmethod
@@ -782,6 +793,14 @@ class App(tk.Tk):
 
         self.run_bg(fetch, on_done=done, dedupe_key="leads")
 
+    def _on_lead_row_double_click(self, _event: object) -> None:
+        selected = self.leads_tree.selection()
+        if not selected:
+            return
+        group_url = self.leads_tree.item(selected[0], "values")[1]
+        if group_url:
+            webbrowser.open(group_url)
+
     def refresh_templates(self) -> None:
         campaign_id = self.selected_campaign_id
         if not campaign_id:
@@ -820,6 +839,102 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", str(exc))
 
         self.run_bg(save, on_done=done, on_error=error)
+
+    # ---------- messages ("Кому написали") ----------
+    def open_messages_window(self) -> None:
+        if self._messages_win is not None and self._messages_win.winfo_exists():
+            self._messages_win.deiconify()
+            self._messages_win.lift()
+            self._load_messages()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Кому написали")
+        win.geometry("980x480")
+        win.minsize(760, 320)
+        self._messages_win = win
+
+        top = ttk.Frame(win, padding=(10, 10, 10, 4))
+        top.pack(fill="x")
+        ttk.Button(top, text="Обновить", command=self._load_messages).pack(side="left")
+        ttk.Button(top, text="Открыть ссылку", style="Accent.TButton", command=self._open_selected_message_link).pack(side="left", padx=(6, 0))
+        ttk.Label(top, text="или двойной клик по строке", foreground="#777").pack(side="left", padx=(8, 0))
+
+        cols = ("date", "campaign", "title", "group_url", "status", "error")
+        tree = ttk.Treeview(win, columns=cols, show="headings")
+        for col, title, width in (
+            ("date", "Когда", 130),
+            ("campaign", "Кампания", 110),
+            ("title", "Группа", 220),
+            ("group_url", "Ссылка", 220),
+            ("status", "Статус", 90),
+            ("error", "Причина ошибки", 260),
+        ):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w")
+        tree.tag_configure("sent", foreground="#2e9e4f")
+        tree.tag_configure("failed", foreground="#c0392b")
+        tree.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        tree.bind("<Double-1>", lambda _event: self._open_selected_message_link())
+        self._messages_tree = tree
+
+        self._load_messages()
+
+    def _load_messages(self) -> None:
+        tree = self._messages_tree
+        if tree is None:
+            return
+
+        def fetch():
+            # limit=1000 — /leads по умолчанию отдаёт только 50, а сообщения нужно сопоставлять
+            # с лидами всех кампаний сразу (join делаем на клиенте — Data Service его не отдаёт).
+            messages = api_request(DATA_URL, "/messages") or []
+            leads = api_request(DATA_URL, "/leads?limit=1000") or []
+            campaigns = api_request(DATA_URL, "/campaigns") or []
+            return messages, leads, campaigns
+
+        def done(result):
+            messages, leads, campaigns = result
+            if self._messages_tree is not tree or not tree.winfo_exists():
+                return
+            leads_by_id = {lead["id"]: lead for lead in leads}
+            campaign_names = {c["id"]: c["name"] for c in campaigns}
+
+            tree.delete(*tree.get_children())
+            self._message_links = {}
+            for m in sorted(messages, key=lambda m: m["sent_at"], reverse=True):
+                lead = leads_by_id.get(m["lead_id"], {})
+                title = lead.get("title") or "-"
+                group_url = lead.get("group_url") or ""
+                campaign_name = campaign_names.get(lead.get("campaign_id"), "-")
+                status = m["delivery_status"]
+                status_text = RU_DELIVERY_STATUS.get(status, status)
+                when = (m.get("sent_at") or "")[:16].replace("T", " ")
+                tree.insert(
+                    "", "end", iid=m["id"],
+                    values=(when, campaign_name, title, group_url, status_text, m.get("error_reason") or ""),
+                    tags=("sent" if status == "sent" else "failed",),
+                )
+                self._message_links[m["id"]] = group_url
+
+        def error(exc):
+            self.flash_status(f"Не удалось загрузить сообщения: {exc}", is_err=True)
+
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="messages")
+
+    def _open_selected_message_link(self) -> None:
+        tree = self._messages_tree
+        if tree is None:
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Кому написали", "Сначала выберите строку в таблице")
+            return
+        url = self._message_links.get(selected[0])
+        if not url:
+            messagebox.showinfo("Кому написали", "У этой записи нет ссылки на группу")
+            return
+        webbrowser.open(url)
 
     # ---------- lifecycle ----------
     def on_stop_app(self) -> None:
