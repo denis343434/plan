@@ -86,6 +86,7 @@ def run_parse_task(
         def on_progress(checked: int, total: int, found: int) -> None:
             task.progress_checked = checked
             task.progress_total = total
+            task.found = found
 
         try:
             raw_leads = adapter.search_communities(keyword, parse_filters, on_progress=on_progress)
