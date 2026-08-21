@@ -84,11 +84,6 @@ class DataServiceClient:
     def patch_lead_status(self, lead_id: str, status: str) -> dict:
         return self._request("PATCH", f"/leads/{lead_id}/status", json={"status": status}).json()
 
-    def patch_lead_chat_href(self, lead_id: str, chat_href: str) -> dict:
-        return self._request(
-            "PATCH", f"/leads/{lead_id}/chat-href", json={"chat_href": chat_href}
-        ).json()
-
     def post_message(self, message: dict) -> dict:
         return self._request("POST", "/messages", json=message).json()
 

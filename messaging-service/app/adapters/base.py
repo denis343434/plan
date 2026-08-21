@@ -18,7 +18,6 @@ class ReplyCheckResult:
     has_reply: bool
     preview: str | None = None
     error: str | None = None
-    resolved_chat_href: str | None = None
 
 
 class InboxAdapter(Protocol):

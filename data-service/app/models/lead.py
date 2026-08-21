@@ -28,4 +28,3 @@ class Lead(UUIDPK, Base):
         ForeignKey("campaigns.id", ondelete="SET NULL"), default=None
     )
     found_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    chat_href: Mapped[str | None] = mapped_column(default=None)

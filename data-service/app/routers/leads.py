@@ -6,13 +6,7 @@ from sqlalchemy.orm import Session
 from app.crud import leads as crud
 from app.database import get_db
 from app.enums import LeadStatus, Platform
-from app.schemas.lead import (
-    LeadBulkCreate,
-    LeadBulkResult,
-    LeadChatHrefUpdate,
-    LeadOut,
-    LeadStatusUpdate,
-)
+from app.schemas.lead import LeadBulkCreate, LeadBulkResult, LeadOut, LeadStatusUpdate
 
 router = APIRouter(prefix="/leads", tags=["leads"])
 
@@ -41,10 +35,3 @@ def update_lead_status(
     lead_id: UUID, update: LeadStatusUpdate, db: Session = Depends(get_db)
 ) -> LeadOut:
     return crud.update_status(db, lead_id, update.status)
-
-
-@router.patch("/{lead_id}/chat-href", response_model=LeadOut)
-def update_lead_chat_href(
-    lead_id: UUID, update: LeadChatHrefUpdate, db: Session = Depends(get_db)
-) -> LeadOut:
-    return crud.update_chat_href(db, lead_id, update.chat_href)

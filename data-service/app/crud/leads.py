@@ -84,11 +84,3 @@ def update_status(db: Session, lead_id: UUID, status: str) -> Lead:
     return lead
 
 
-def update_chat_href(db: Session, lead_id: UUID, chat_href: str) -> Lead:
-    lead = db.get(Lead, lead_id)
-    if lead is None:
-        raise NotFoundError(f"lead {lead_id} not found")
-    lead.chat_href = chat_href
-    db.commit()
-    db.refresh(lead)
-    return lead

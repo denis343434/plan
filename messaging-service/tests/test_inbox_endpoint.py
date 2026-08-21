@@ -131,51 +131,6 @@ def test_check_inbox_with_reply_updates_message_and_lead(monkeypatch):
 
 
 @respx.mock
-def test_check_inbox_persists_resolved_chat_href_on_lead(monkeypatch):
-    account_id = str(uuid.uuid4())
-    lead_id = str(uuid.uuid4())
-    message_id = str(uuid.uuid4())
-
-    respx.get(f"{BASE}/messages").mock(
-        return_value=httpx.Response(200, json=[_message_payload(message_id, lead_id, account_id)])
-    )
-    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[_lead_payload(lead_id)]))
-    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
-        return_value=httpx.Response(
-            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
-        )
-    )
-    respx.patch(f"{BASE}/messages/{message_id}/reply").mock(
-        return_value=httpx.Response(200, json=_message_payload(message_id, lead_id, account_id, "no_reply"))
-    )
-    chat_href_route = respx.patch(f"{BASE}/leads/{lead_id}/chat-href").mock(
-        return_value=httpx.Response(200, json=_lead_payload(lead_id))
-    )
-
-    class _FakeInboxAdapter:
-        def check_replies(self, leads, on_progress=None):
-            total = len(leads)
-            results = {}
-            for checked, lead in enumerate(leads, start=1):
-                results[lead["id"]] = ReplyCheckResult(
-                    has_reply=False, resolved_chat_href="/im/convo/-777?sel=-777"
-                )
-                if on_progress is not None:
-                    on_progress(checked, total)
-            return results
-
-    monkeypatch.setattr("app.inbox.get_inbox_adapter", lambda platform, storage_state=None: _FakeInboxAdapter())
-
-    with TestClient(app) as client:
-        client.post("/inbox/check", params={"account_id": account_id})
-        client.get("/inbox/check-status", params={"account_id": account_id})
-
-    assert chat_href_route.called
-    sent_body = json.loads(chat_href_route.calls.last.request.content)
-    assert sent_body["chat_href"] == "/im/convo/-777?sel=-777"
-
-
-@respx.mock
 def test_check_inbox_with_no_pending_messages_short_circuits():
     account_id = str(uuid.uuid4())
     respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))

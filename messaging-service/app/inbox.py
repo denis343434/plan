@@ -109,12 +109,6 @@ def run_inbox_check_task(account_id: str, limit: int = _DEFAULT_CHECK_LIMIT) -> 
             if result is None:
                 continue
 
-            if result.resolved_chat_href and result.resolved_chat_href != lead.get("chat_href"):
-                try:
-                    client.patch_lead_chat_href(lead["id"], result.resolved_chat_href)
-                except DataServiceError:
-                    logger.exception("failed to cache chat_href for lead %s", lead["id"])
-
             if result.has_reply:
                 client.update_message_reply(message["id"], "replied", result.preview)
                 try:
