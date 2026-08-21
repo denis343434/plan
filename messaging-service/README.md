@@ -70,6 +70,43 @@ locking-логика и лимиты проверяются по-настоящ�
 При флуд-сигнале от адаптера (капча/ограничение) — `POST /accounts/{id}/cooldown` вместо
 `release`, чтобы не сбросить статус обратно в `active`.
 
+## Входящие сообщения (проверка ответов)
+
+Асинхронно, как и рассылка (`POST .../send` + `GET .../send-status`) — один обход всех
+переписок в реальном браузере может занять минуты, блокирующий запрос на всё это время выглядел
+бы для клиента как зависание:
+
+```bash
+curl -X POST "http://localhost:8003/inbox/check?account_id={account_id}"
+# 202 {"account_id":"...","status":"queued","checked":0,"total":0,"replied":0,"error":null,"results":[]}
+
+curl "http://localhost:8003/inbox/check-status?account_id={account_id}"
+# {"account_id":"...","status":"running","checked":4,"total":12,"replied":1,"error":null,"results":[]}
+# ...затем status:"done", results заполнен целиком
+```
+
+Повторный `POST .../check`, пока задача ещё `running`, не запускает вторую параллельную
+задачу — возвращает текущий прогресс.
+
+Задача берёт до `limit` (по умолчанию 20) отправленных этим аккаунтом сообщений, у которых ещё
+нет `reply_status=replied`, открывает переписку с каждым лидом в одном браузерном контексте
+(`VkInboxAdapter.check_replies` в `app/adapters/vk.py`, прогресс — `checked`/`total` в задаче
+растут по ходу) и смотрит, есть ли новое входящее сообщение. При находке — `PATCH
+/messages/{id}/reply` (`reply_status=replied`, `reply_preview`) и `PATCH /leads/{id}/status`
+(`status=replied`) в Data Service; если ответа нет — `reply_status=no_reply` (перепроверяется
+при следующем вызове, вдруг ответ придёт позже).
+
+С `VK_ADAPTER_MODE=fake` (по умолчанию) используется `DryRunInboxAdapter` — всегда
+`has_reply=false`, реальный VK не открывается.
+
+**Не проверено вживую** (в отличие от адаптера отправки — см. следующий раздел): селекторы
+для чтения переписки (`_MESSAGE_BUBBLE_SELECTORS` в `app/adapters/vk.py`) и эвристика
+"своё/чужое сообщение" по выравниванию — первая проверка и правка по факту нужна на реальном
+залогиненном аккаунте. Таймауты на эти селекторы намеренно короткие (один
+`wait_for_selector` на все кандидаты сразу, ≤6с) именно потому, что они непроверенные — пока
+не подтверждены живьём, лучше быстро сдаться на лида и пойти к следующему, чем ждать полный
+таймаут на каждый из трёх кандидатов по очереди.
+
 ## Реальный VK (Playwright)
 
 1. Создать аккаунт в Data Service (`POST /accounts`, `purpose=messaging` или `both`).
@@ -103,9 +140,15 @@ pytest
 `DryRunAdapter`/подменённый адаптер — без браузера) и не требуют ни реального VK, ни
 запущенного Data Service:
 
-- `test_adapters_registry.py` — выбор `DryRunAdapter`/`VkSendAdapter` по `platform`/`VK_ADAPTER_MODE`.
+- `test_adapters_registry.py` — выбор `DryRunAdapter`/`VkSendAdapter` и
+  `DryRunInboxAdapter`/`VkInboxAdapter` по `platform`/`VK_ADAPTER_MODE`.
 - `test_templating.py` — подстановка плейсхолдеров, `random.choice` между A/B-вариантами.
 - `test_task_status_transitions.py` — переходы `queued→running→done/waiting_for_account/failed`,
   флуд-сигнал → `cooldown` вместо `release`.
 - `test_send_endpoint_mocked.py` — `POST /campaigns/{id}/send` + `GET .../send-status` целиком,
   повторный `POST` во время `running` не дублирует задачу.
+- `test_inbox_endpoint.py` — `POST /inbox/check` + `GET /inbox/check-status`: без ответа →
+  `reply_status=no_reply`, с найденным ответом (через подменённый адаптер) →
+  `reply_status=replied` + `leads.status=replied`, пустой список сообщений — без похода за
+  сессией, повторный `POST` во время `running` не дублирует задачу, статус для неизвестного
+  `account_id` — 404.

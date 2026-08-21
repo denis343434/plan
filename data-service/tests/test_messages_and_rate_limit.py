@@ -27,7 +27,7 @@ def _create_lead(client: TestClient, external_id: str) -> str:
     return resp.json()["lead_ids"][0]
 
 
-def _send_message(client: TestClient, lead_id: str, account_id: str) -> None:
+def _send_message(client: TestClient, lead_id: str, account_id: str) -> str:
     resp = client.post(
         "/messages",
         json={
@@ -38,6 +38,7 @@ def _send_message(client: TestClient, lead_id: str, account_id: str) -> None:
         },
     )
     assert resp.status_code == 200
+    return resp.json()["id"]
 
 
 def test_hourly_limit_blocks_next_available_until_window_expires(client: TestClient) -> None:
@@ -69,3 +70,25 @@ def test_hourly_limit_blocks_next_available_until_window_expires(client: TestCli
     available = client.post("/accounts/next-available", json={"platform": "vk", "purpose": "messaging"})
     assert available.status_code == 200
     assert available.json()["id"] == account_id
+
+
+def test_update_message_reply_sets_status_preview_and_replied_at(client: TestClient) -> None:
+    account_id = _create_account(client)
+    lead_id = _create_lead(client, "reply1")
+    message_id = _send_message(client, lead_id, account_id)
+
+    resp = client.patch(
+        f"/messages/{message_id}/reply",
+        json={"reply_status": "replied", "reply_preview": "Здравствуйте, интересно!"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reply_status"] == "replied"
+    assert body["reply_preview"] == "Здравствуйте, интересно!"
+    assert body["replied_at"] is not None
+
+    missing = client.patch(
+        "/messages/00000000-0000-0000-0000-000000000000/reply",
+        json={"reply_status": "replied"},
+    )
+    assert missing.status_code == 404

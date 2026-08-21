@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.crud import messages as crud
 from app.database import get_db
-from app.schemas.message import MessageCreate, MessageOut
+from app.schemas.message import MessageCreate, MessageOut, MessageReplyUpdate
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -22,3 +22,10 @@ def list_messages(
     db: Session = Depends(get_db),
 ) -> list[MessageOut]:
     return crud.list_messages(db, lead_id=lead_id, account_id=account_id)
+
+
+@router.patch("/{message_id}/reply", response_model=MessageOut)
+def update_message_reply(
+    message_id: UUID, update: MessageReplyUpdate, db: Session = Depends(get_db)
+) -> MessageOut:
+    return crud.update_reply(db, message_id, update)

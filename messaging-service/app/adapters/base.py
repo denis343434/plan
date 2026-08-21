@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 @dataclass
@@ -11,3 +11,17 @@ class SendResult:
 
 class SendAdapter(Protocol):
     def send_message(self, lead: dict, account: dict, text: str) -> SendResult: ...
+
+
+@dataclass
+class ReplyCheckResult:
+    has_reply: bool
+    preview: str | None = None
+    error: str | None = None
+    resolved_chat_href: str | None = None
+
+
+class InboxAdapter(Protocol):
+    def check_replies(
+        self, leads: list[dict], on_progress: Callable[[int, int], None] | None = None
+    ) -> dict[str, ReplyCheckResult]: ...

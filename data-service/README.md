@@ -73,6 +73,11 @@ curl -X POST http://localhost:8001/messages -H "Content-Type: application/json" 
 }'
 curl "http://localhost:8001/messages?account_id=..."
 
+curl -X PATCH http://localhost:8001/messages/{id}/reply -H "Content-Type: application/json" -d '{
+  "reply_status":"replied","reply_preview":"Здравствуйте, интересно!"
+}'
+# записывает reply_status/reply_preview, replied_at ставится сервером (now()) при status=replied
+
 curl -X POST http://localhost:8001/campaigns -H "Content-Type: application/json" -d '{
   "name":"Summer promo","platform":"vk","keyword":"fitness"
 }'

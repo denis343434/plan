@@ -84,8 +84,25 @@ class DataServiceClient:
     def patch_lead_status(self, lead_id: str, status: str) -> dict:
         return self._request("PATCH", f"/leads/{lead_id}/status", json={"status": status}).json()
 
+    def patch_lead_chat_href(self, lead_id: str, chat_href: str) -> dict:
+        return self._request(
+            "PATCH", f"/leads/{lead_id}/chat-href", json={"chat_href": chat_href}
+        ).json()
+
     def post_message(self, message: dict) -> dict:
         return self._request("POST", "/messages", json=message).json()
+
+    def list_messages(self, account_id: str | None = None, lead_id: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {}
+        if account_id is not None:
+            params["account_id"] = account_id
+        if lead_id is not None:
+            params["lead_id"] = lead_id
+        return self._request("GET", "/messages", params=params).json()
+
+    def update_message_reply(self, message_id: str, reply_status: str, reply_preview: str | None = None) -> dict:
+        body = {"reply_status": reply_status, "reply_preview": reply_preview}
+        return self._request("PATCH", f"/messages/{message_id}/reply", json=body).json()
 
     def get_campaign(self, campaign_id: str) -> dict:
         return self._request("GET", f"/campaigns/{campaign_id}").json()

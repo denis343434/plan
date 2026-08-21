@@ -28,6 +28,10 @@ class LeadStatusUpdate(BaseModel):
     status: LeadStatus
 
 
+class LeadChatHrefUpdate(BaseModel):
+    chat_href: str
+
+
 class LeadOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -40,3 +44,4 @@ class LeadOut(BaseModel):
     status: LeadStatus
     campaign_id: UUID | None
     found_at: datetime
+    chat_href: str | None

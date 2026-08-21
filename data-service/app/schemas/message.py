@@ -16,6 +16,11 @@ class MessageCreate(BaseModel):
     error_reason: str | None = None
 
 
+class MessageReplyUpdate(BaseModel):
+    reply_status: ReplyStatus
+    reply_preview: str | None = None
+
+
 class MessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -28,3 +33,5 @@ class MessageOut(BaseModel):
     delivery_status: DeliveryStatus
     reply_status: ReplyStatus
     error_reason: str | None
+    reply_preview: str | None
+    replied_at: datetime | None

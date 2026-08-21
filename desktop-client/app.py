@@ -83,6 +83,7 @@ RU_STATS_LABEL = {
     "rejected": "отклонены",
 }
 RU_DELIVERY_STATUS = {"sent": "отправлено", "failed": "ошибка", "pending": "в очереди"}
+RU_REPLY_STATUS = {"none": "-", "replied": "есть ответ", "no_reply": "нет ответа"}
 RU_PURPOSE_REVERSE = {v: k for k, v in RU_PURPOSE.items()}
 PLATFORM_LABELS = {"vk": "VK", "telegram": "Telegram", "instagram": "Instagram"}
 PLATFORM_REVERSE = {v: k for k, v in PLATFORM_LABELS.items()}
@@ -147,6 +148,12 @@ class App(tk.Tk):
         # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
         # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
         self._message_links: dict[str, str] = {}
+        # логин -> account_id для комбобокса выбора аккаунта в окне "Кому написали"
+        # (проверка входящих запускается за конкретный аккаунт — своя переписка/сессия).
+        self._account_id_by_login: dict[str, str] = {}
+        # account_id, для которого сейчас идёт фоновая проверка входящих (см. _poll_inbox_check) —
+        # None, когда проверка не запущена; не даёт запустить вторую поверх идущей.
+        self._inbox_check_account_id: str | None = None
 
         self._build_layout()
         self._schedule_list_refresh()
@@ -850,13 +857,14 @@ class App(tk.Tk):
         if self._messages_win is not None and self._messages_win.winfo_exists():
             self._messages_win.deiconify()
             self._messages_win.lift()
+            self._refresh_message_account_choices()
             self._load_messages()
             return
 
         win = tk.Toplevel(self)
         win.title("Кому написали")
-        win.geometry("980x480")
-        win.minsize(760, 320)
+        win.geometry("1180x520")
+        win.minsize(900, 340)
         self._messages_win = win
 
         top = ttk.Frame(win, padding=(10, 10, 10, 4))
@@ -865,24 +873,37 @@ class App(tk.Tk):
         ttk.Button(top, text="Открыть ссылку", style="Accent.TButton", command=self._open_selected_message_link).pack(side="left", padx=(6, 0))
         ttk.Label(top, text="или двойной клик по строке", foreground="#777").pack(side="left", padx=(8, 0))
 
-        cols = ("date", "campaign", "title", "group_url", "status", "error")
+        inbox_bar = ttk.Frame(win, padding=(10, 0, 10, 8))
+        inbox_bar.pack(fill="x")
+        ttk.Label(inbox_bar, text="Проверить входящие для аккаунта:").pack(side="left")
+        self.msg_account_combo = ttk.Combobox(inbox_bar, width=18, state="readonly")
+        self.msg_account_combo.pack(side="left", padx=(6, 6))
+        ttk.Button(inbox_bar, text="Проверить ответы", style="Accent.TButton", command=self.on_check_inbox).pack(side="left")
+        self.inbox_check_status = ttk.Label(inbox_bar, text="", foreground="#777")
+        self.inbox_check_status.pack(side="left", padx=(10, 0))
+
+        cols = ("date", "campaign", "title", "group_url", "status", "reply", "reply_text", "error")
         tree = ttk.Treeview(win, columns=cols, show="headings")
         for col, title, width in (
-            ("date", "Когда", 130),
-            ("campaign", "Кампания", 110),
-            ("title", "Группа", 220),
-            ("group_url", "Ссылка", 220),
+            ("date", "Когда", 120),
+            ("campaign", "Кампания", 100),
+            ("title", "Группа", 170),
+            ("group_url", "Ссылка", 170),
             ("status", "Статус", 90),
-            ("error", "Причина ошибки", 260),
+            ("reply", "Ответ", 90),
+            ("reply_text", "Текст ответа", 220),
+            ("error", "Причина ошибки", 200),
         ):
             tree.heading(col, text=title)
             tree.column(col, width=width, anchor="w")
         tree.tag_configure("sent", foreground="#2e9e4f")
         tree.tag_configure("failed", foreground="#c0392b")
+        tree.tag_configure("replied", foreground="#2f5ad0")
         tree.pack(fill="both", expand=True, padx=10, pady=(4, 10))
         tree.bind("<Double-1>", lambda _event: self._open_selected_message_link())
         self._messages_tree = tree
 
+        self._refresh_message_account_choices()
         self._load_messages()
 
     def _load_messages(self) -> None:
@@ -914,11 +935,22 @@ class App(tk.Tk):
                 campaign_name = campaign_names.get(lead.get("campaign_id"), "-")
                 status = m["delivery_status"]
                 status_text = RU_DELIVERY_STATUS.get(status, status)
+                reply_status = m.get("reply_status", "none")
+                reply_text = RU_REPLY_STATUS.get(reply_status, reply_status)
                 when = (m.get("sent_at") or "")[:16].replace("T", " ")
+                # replied — самое заметное (это и есть входящее сообщение), иначе как раньше:
+                # failed/sent по статусу доставки.
+                if reply_status == "replied":
+                    tag = "replied"
+                else:
+                    tag = "sent" if status == "sent" else "failed"
                 tree.insert(
                     "", "end", iid=m["id"],
-                    values=(when, campaign_name, title, group_url, status_text, m.get("error_reason") or ""),
-                    tags=("sent" if status == "sent" else "failed",),
+                    values=(
+                        when, campaign_name, title, group_url, status_text,
+                        reply_text, m.get("reply_preview") or "", m.get("error_reason") or "",
+                    ),
+                    tags=(tag,),
                 )
                 self._message_links[m["id"]] = group_url
 
@@ -940,6 +972,81 @@ class App(tk.Tk):
             messagebox.showinfo("Кому написали", "У этой записи нет ссылки на группу")
             return
         webbrowser.open(url)
+
+    def _refresh_message_account_choices(self) -> None:
+        # Только messaging/both — у "чисто парсинговых" аккаунтов отправленных сообщений
+        # не бывает, проверять для них входящие нечего.
+        accounts = [a for a in self._accounts_cache.values() if a.get("purpose") in ("messaging", "both")]
+        self._account_id_by_login = {a["login"]: a["id"] for a in accounts}
+        logins = list(self._account_id_by_login)
+        self.msg_account_combo.configure(values=logins)
+        if logins and self.msg_account_combo.get() not in logins:
+            self.msg_account_combo.set(logins[0])
+
+    def on_check_inbox(self) -> None:
+        login = self.msg_account_combo.get()
+        account_id = self._account_id_by_login.get(login)
+        if not account_id:
+            messagebox.showinfo("Входящие", "Выберите аккаунт для проверки — сначала войдите в VK хотя бы под одним")
+            return
+        if self._inbox_check_account_id is not None:
+            messagebox.showinfo("Входящие", "Проверка уже идёт, дождитесь её окончания")
+            return
+
+        self._inbox_check_account_id = account_id
+        self.inbox_check_status.configure(text="запускаю проверку…")
+
+        def start():
+            # Messaging Service запускает проверку фоновой задачей и сразу отвечает (не ждёт
+            # обхода всех переписок в реальном браузере) — прогресс опрашивается отдельно,
+            # см. _poll_inbox_check. Раньше это был один блокирующий запрос на весь батч —
+            # при реальном VK-аккаунте с десятками сообщений выглядело как зависшее окно.
+            return api_request(MESSAGING_URL, f"/inbox/check?account_id={account_id}", method="POST")
+
+        def started(_result):
+            self.after(500, lambda: self._poll_inbox_check(account_id))
+
+        def error(exc):
+            self._inbox_check_account_id = None
+            self.inbox_check_status.configure(text="")
+            messagebox.showerror("Входящие", str(exc))
+
+        self.run_bg(start, on_done=started, on_error=error)
+
+    def _poll_inbox_check(self, account_id: str) -> None:
+        if self._messages_win is None or not self._messages_win.winfo_exists():
+            self._inbox_check_account_id = None
+            return
+
+        def fetch():
+            return api_request(MESSAGING_URL, f"/inbox/check-status?account_id={account_id}", timeout=15.0)
+
+        def done(result):
+            if self._messages_win is None or not self._messages_win.winfo_exists():
+                self._inbox_check_account_id = None
+                return
+            status = result["status"]
+            if status in ("queued", "running"):
+                self.inbox_check_status.configure(text=f"проверяю переписки в VK… {result['checked']}/{result['total']}")
+                self.after(2000, lambda: self._poll_inbox_check(account_id))
+                return
+
+            self._inbox_check_account_id = None
+            if status == "failed":
+                self.inbox_check_status.configure(text="")
+                messagebox.showerror("Входящие", result.get("error") or "не удалось проверить входящие")
+                return
+
+            self.inbox_check_status.configure(text=f"проверено {result['checked']}, новых ответов: {result['replied']}")
+            self.flash_status(f"Входящие: проверено {result['checked']}, новых ответов: {result['replied']}")
+            self._load_messages()
+
+        def error(exc):
+            self._inbox_check_account_id = None
+            self.inbox_check_status.configure(text="")
+            messagebox.showerror("Входящие", str(exc))
+
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="inbox_check_status")
 
     # ---------- lifecycle ----------
     def on_stop_app(self) -> None:

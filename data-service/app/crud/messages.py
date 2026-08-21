@@ -3,8 +3,9 @@ from uuid import UUID
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from app.exceptions import NotFoundError
 from app.models.message import Message
-from app.schemas.message import MessageCreate
+from app.schemas.message import MessageCreate, MessageReplyUpdate
 
 
 def create_message(db: Session, message: MessageCreate) -> Message:
@@ -13,6 +14,18 @@ def create_message(db: Session, message: MessageCreate) -> Message:
     db.commit()
     db.refresh(db_message)
     return db_message
+
+
+def update_reply(db: Session, message_id: UUID, update: MessageReplyUpdate) -> Message:
+    message = db.get(Message, message_id)
+    if message is None:
+        raise NotFoundError(f"message {message_id} not found")
+    message.reply_status = update.reply_status
+    message.reply_preview = update.reply_preview
+    message.replied_at = func.now() if update.reply_status == "replied" else None
+    db.commit()
+    db.refresh(message)
+    return message
 
 
 def list_messages(

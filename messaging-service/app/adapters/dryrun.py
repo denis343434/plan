@@ -1,6 +1,7 @@
 import logging
+from typing import Callable
 
-from app.adapters.base import SendResult
+from app.adapters.base import ReplyCheckResult, SendResult
 
 logger = logging.getLogger(__name__)
 
@@ -25,3 +26,22 @@ class DryRunAdapter:
             text,
         )
         return SendResult(success=True)
+
+
+class DryRunInboxAdapter:
+    """Fake-режим (VK_ADAPTER_MODE=fake) и tg/instagram — без браузера, без реальных ответов.
+
+    Как и DryRunAdapter, нужен, чтобы весь пайплайн (эндпоинт, запись reply_status в БД,
+    десктоп-клиент) можно было гонять и тестировать без живого VK-аккаунта.
+    """
+
+    def check_replies(
+        self, leads: list[dict], on_progress: Callable[[int, int], None] | None = None
+    ) -> dict[str, ReplyCheckResult]:
+        total = len(leads)
+        results: dict[str, ReplyCheckResult] = {}
+        for checked, lead in enumerate(leads, start=1):
+            results[lead["id"]] = ReplyCheckResult(has_reply=False)
+            if on_progress is not None:
+                on_progress(checked, total)
+        return results

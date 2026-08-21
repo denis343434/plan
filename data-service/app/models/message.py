@@ -31,3 +31,5 @@ class Message(UUIDPK, Base):
     )
     reply_status: Mapped[str] = mapped_column(nullable=False, default="none", server_default="none")
     error_reason: Mapped[str | None] = mapped_column(default=None)
+    reply_preview: Mapped[str | None] = mapped_column(default=None)
+    replied_at: Mapped[datetime | None] = mapped_column(default=None)
