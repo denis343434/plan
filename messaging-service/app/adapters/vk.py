@@ -13,6 +13,14 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Было 20_000 везде в этом файле — проверено вживую 2026-08-21 (диагностика парсер-сервиса,
+# та же VK-сессия/среда): реальный контент VK иногда прогружается только через ~18-20с после
+# domcontentloaded (страница до этого висит в скелетон-заглушке). 20с таймаут стоял впритык к
+# этому и регулярно ловил "не успело отрисоваться" как настоящую ошибку (кнопка "Написать
+# сообщение" недоступна / поле ввода не появилось) — хотя по факту элемент просто ещё не
+# отрисовался. Единый таймаут с запасом вместо разрозненных 20_000 по всему файлу.
+_SLOW_RENDER_TIMEOUT_MS = 40_000
+
 # Проверено вживую 2026-08-20: "vk.com/im?sel=-{external_id}" ломается, если external_id —
 # screen_name сообщества (не число), а не сам числовой ID группы — именно так теперь выглядит
 # external_id (см. parser-service/app/adapters/vk.py, современный поиск отдаёт screen_name).
@@ -42,6 +50,36 @@ _MESSAGE_ITEM_SELECTOR = ".ConvoMessageWithoutBubble"
 _MESSAGE_AUTHOR_LINK_SELECTOR = ".ConvoMessageHeader__authorLink"
 _MESSAGE_TEXT_SELECTOR = ".ConvoMessageWithoutBubble__text"
 
+# ПРЕЖНИЙ подход (общий бейдж непрочитанных в левом меню, "#l_msg [data-testid=...]") дважды
+# ловил ложное срабатывание вживую на бизнес-переписке (см. историю в git) и был выброшен.
+# Взамен — список диалогов vk.com/im с включённым встроенным тумблером VK "Только
+# непрочитанные" (нижний колонтитул списка): когда он активен, VK сам показывает в списке
+# ТОЛЬКО диалоги с непрочитанным — не нужно самостоятельно проверять счётчик у каждого
+# элемента, достаточно собрать заголовки того, что осталось видно. Подтверждено пользователем
+# 2026-08-21 на реальном DOM:
+#   <label class="ConvoList__footer">
+#     ...
+#     <span class="ConvoList__footerText">Только непрочитанные</span>
+#     <div class="ConvoList__footerSwitch">
+#       <label class="vkuiSwitch__host ...">
+#         <input class="vkuiSwitch__inputNative ..." type="checkbox" role="switch" aria-checked="true">
+#         ...
+#       </label>
+#     </div>
+#   </label>
+#   ...
+#   <div data-itemkey="convo_-235257158" class="ConvoList__item ...">
+#     <h3 class="ConvoTitle__author" title="Тренажерный зал «YaGOda» Южный город">...</h3>
+#     ...
+#   </div>
+# title у .ConvoTitle__author совпадает с lead["title"], который уже сохранён в базе при
+# парсинге — сопоставляем по нему, без доп. запросов на резолв id. Пользователь подтвердил
+# вживую: просто открыть vk.com/im, не кликая в чат, счётчики непрочитанных НЕ сбрасывает.
+_ONLY_UNREAD_SWITCH_SELECTOR = '.ConvoList__footer input[role="switch"]'
+_ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR = ".ConvoList__footer .vkuiSwitch__host"
+_CONVO_ITEM_SELECTOR = ".ConvoList__item"
+_CONVO_TITLE_SELECTOR = ".ConvoTitle__author"
+
 
 def _sleep_random() -> None:
     time.sleep(random.uniform(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC))
@@ -63,11 +101,12 @@ class VkSendAdapter:
                 # конкретных элементов — надёжнее.
                 page.goto(lead["group_url"], wait_until="domcontentloaded")
                 try:
-                    send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=20_000)
+                    send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     # Не проблема аккаунта/кода — либо сообщество отключило приём сообщений
                     # от посторонних (кнопки физически нет), либо VK не успел её отрисовать
-                    # за 20с. В обоих случаях это лид-специфичная неудача, не флуд/бан аккаунта.
+                    # за _SLOW_RENDER_TIMEOUT_MS. В обоих случаях это лид-специфичная неудача,
+                    # не флуд/бан аккаунта.
                     return SendResult(
                         success=False,
                         error="у сообщества недоступна кнопка «Написать сообщение» — либо приём сообщений отключён, либо страница не успела прогрузиться",
@@ -81,11 +120,11 @@ class VkSendAdapter:
                     return SendResult(success=False, error=flood, flood_detected=True)
 
                 try:
-                    page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=20_000)
+                    page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     return SendResult(
                         success=False,
-                        error="чат открылся, но поле ввода сообщения не появилось за 20с (медленный рендер VK)",
+                        error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер VK)",
                     )
                 page.click(_MESSAGE_INPUT_SELECTOR)
                 _sleep_random()
@@ -127,12 +166,16 @@ class VkSendAdapter:
 class VkInboxAdapter:
     """Читает диалоги уже отправленных лидов, чтобы найти входящие ответы.
 
-    Один браузерный контекст на весь батч лидов (не один на лида, как в VkSendAdapter) —
-    иначе повторный запуск/закрытие Chromium на каждый чат сделал бы проверку 20+ лидов
-    минутами и выглядело бы для VK подозрительнее, чем один сеанс просмотра нескольких чатов.
-    Внутри этого одного контекста лиды разбираются несколькими Page параллельно
-    (settings.INBOX_CHECK_CONCURRENCY) — те же куки/логин, просто несколько вкладок вместо
-    одной последовательной очереди.
+    ВАЖНО про потоки: Playwright sync API жёстко привязывает Page/Browser/BrowserContext к
+    OS-потоку, в котором был создан их sync_playwright() — обращение к ним из другого потока
+    падает с "Cannot switch to a different thread" (проверено вживую 2026-08-21: с одним общим
+    BrowserContext на несколько потоков падал КАЖДЫЙ лид, исключение тихо ловилось в _check_one
+    и превращалось в has_reply=False — реальные ответы, например от "Кафе Миндаль", никогда не
+    находились). Поэтому параллелизм здесь — не несколько Page в одном общем браузере, а
+    несколько ПОЛНОСТЬЮ независимых sync_playwright()/Browser/BrowserContext, каждый в своём
+    потоке (см. _run_worker), с одним и тем же storage_state (один и тот же залогиненный
+    аккаунт). Это отдельные параллельные VK-сессии одного аккаунта, а не "вкладки одного
+    браузера" — потенциально заметнее для антибот-систем VK, чем прежнее (нерабочее) намерение.
     """
 
     def __init__(self, storage_state: dict) -> None:
@@ -146,8 +189,8 @@ class VkInboxAdapter:
         if total == 0:
             return results
 
-        progress_lock = threading.Lock()
         checked = 0
+        progress_lock = threading.Lock()
 
         def report_progress() -> None:
             nonlocal checked
@@ -157,83 +200,148 @@ class VkInboxAdapter:
             if on_progress is not None:
                 on_progress(current, total)
 
-        def worker(page: Page, leads_slice: list[dict]) -> None:
-            for lead in leads_slice:
-                results[lead["id"]] = self._check_one(page, lead)
-                report_progress()
-                _sleep_random()
+        leads_to_check = leads
+        if settings.INBOX_CHECK_FILTER_BY_UNREAD_LIST:
+            unread_titles = self._read_unread_titles_gate()
+            if unread_titles is None:
+                logger.info(
+                    "inbox check: could not read VK unread dialog list, falling back to full scan of %d lead(s)",
+                    total,
+                )
+            else:
+                leads_to_check = []
+                for lead in leads:
+                    title = (lead.get("title") or "").strip()
+                    # Без title сопоставить с диалогом нечем — не гадаем, проверяем лида напрямую,
+                    # а не молча считаем его "без ответа".
+                    if not title or title in unread_titles:
+                        leads_to_check.append(lead)
+                    else:
+                        results[lead["id"]] = ReplyCheckResult(has_reply=False)
+                        report_progress()
+                logger.info(
+                    "inbox check: unread dialog list matched %d/%d lead(s) by title, skipping the rest",
+                    len(leads_to_check),
+                    total,
+                )
 
+        if not leads_to_check:
+            return results
+
+        worker_count = max(1, min(settings.INBOX_CHECK_CONCURRENCY, len(leads_to_check)))
+        buckets: list[list[dict]] = [[] for _ in range(worker_count)]
+        for i, lead in enumerate(leads_to_check):
+            buckets[i % worker_count].append(lead)
+
+        def run_worker(leads_slice: list[dict]) -> None:
+            if not leads_slice:
+                return
+            thread_name = threading.current_thread().name
+            logger.info(
+                "inbox check: worker %s starting, %d lead(s) in bucket", thread_name, len(leads_slice)
+            )
+            # Собственный независимый Playwright-драйвер целиком внутри этого потока — см.
+            # предупреждение о потоках в докстринге класса.
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
+                context = browser.new_context(storage_state=self._storage_state or None)
+                try:
+                    page = context.new_page()
+                    for lead in leads_slice:
+                        logger.info(
+                            "inbox check: worker %s checking lead %s", thread_name, lead["id"]
+                        )
+                        results[lead["id"]] = self._check_one(page, lead)
+                        report_progress()
+                        _sleep_random()
+                finally:
+                    context.close()
+                    browser.close()
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(run_worker, bucket) for bucket in buckets if bucket]
+            for future in futures:
+                future.result()
+        return results
+
+    def _read_unread_titles_gate(self) -> set[str] | None:
+        """Разовая проверка списка диалогов VK — отдельная короткая Playwright-сессия в
+        вызывающем потоке, до того как запускаются потоки-воркеры для самого обхода."""
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
-            # Несколько Page в одном BrowserContext — те же куки/логин, что и раньше (один
-            # аккаунт), просто несколько параллельных "вкладок" вместо одной последовательной —
-            # так и снижаем ~40с/лид без множественных запусков Chromium или второй сессии.
             context = browser.new_context(storage_state=self._storage_state or None)
             try:
-                page_count = max(1, min(settings.INBOX_CHECK_CONCURRENCY, total))
-                pages = [context.new_page() for _ in range(page_count)]
-                buckets: list[list[dict]] = [[] for _ in pages]
-                for i, lead in enumerate(leads):
-                    buckets[i % len(pages)].append(lead)
-
-                with ThreadPoolExecutor(max_workers=len(pages)) as executor:
-                    futures = [
-                        executor.submit(worker, page, bucket)
-                        for page, bucket in zip(pages, buckets)
-                        if bucket
-                    ]
-                    for future in futures:
-                        future.result()
+                return self._list_unread_conversation_titles(context.new_page())
             finally:
                 context.close()
                 browser.close()
-        return results
+
+    def _list_unread_conversation_titles(self, page: Page) -> set[str] | None:
+        """Заголовки диалогов в списке vk.com/im, у которых есть непрочитанные сообщения.
+
+        None означает "не удалось определить" (страница/список не прогрузились) — в этом
+        случае вызывающий код обязан пойти по полному циклу, а не гадать.
+        """
+        try:
+            page.goto("https://vk.com/im", wait_until="domcontentloaded")
+        except Exception:
+            return None
+
+        try:
+            page.wait_for_selector(_ONLY_UNREAD_SWITCH_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            return None  # список диалогов вообще не отрисовался — не гадаем
+
+        switch = page.query_selector(_ONLY_UNREAD_SWITCH_SELECTOR)
+        if switch is not None and switch.get_attribute("aria-checked") != "true":
+            # Кликаем по видимому визуальному переключателю, а не по спрятанному нативному
+            # input — так же, как это делает живой пользователь.
+            clickable = page.query_selector(_ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR) or switch
+            clickable.click()
+            page.wait_for_timeout(1000)  # список перестраивается под фильтр не мгновенно
+
+        # Список — часть SPA и дорисовывается уже после domcontentloaded, как и всё остальное
+        # на VK — даём время осесть перед чтением.
+        page.wait_for_timeout(500)
+
+        titles: set[str] = set()
+        for item in page.query_selector_all(_CONVO_ITEM_SELECTOR):
+            title_el = item.query_selector(_CONVO_TITLE_SELECTOR)
+            if title_el is None:
+                continue
+            title = (title_el.get_attribute("title") or title_el.inner_text() or "").strip()
+            if title:
+                titles.add(title)
+        return titles
 
     def _check_one(self, page: Page, lead: dict) -> ReplyCheckResult:
         try:
-            cached_href = lead.get("chat_href")
-            if cached_href:
-                page.goto(urljoin(page.url, cached_href), wait_until="domcontentloaded")
-                try:
-                    page.wait_for_selector(_MESSAGE_ITEM_SELECTOR, timeout=20_000)
-                except PlaywrightTimeoutError:
-                    # Мы уже отправляли этому лиду сообщение, значит переписка не может быть
-                    # пустой — таймаут тут значит, что кэш протух (сообщество сменило ID, ссылка
-                    # больше никуда не ведёт), а не "ответа ещё нет". Переразрешаем один раз через
-                    # страницу сообщества, как раньше.
-                    cached_href = None
+            page.goto(lead["group_url"], wait_until="domcontentloaded")
+            try:
+                send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return ReplyCheckResult(
+                    has_reply=False,
+                    error="кнопка «Написать сообщение» недоступна — переписку не открыть",
+                )
+            chat_href = send_btn.get_attribute("href")
+            page.goto(urljoin(page.url, chat_href), wait_until="domcontentloaded")
 
-            resolved_href: str | None = None
-            if not cached_href:
-                page.goto(lead["group_url"], wait_until="domcontentloaded")
-                try:
-                    send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=20_000)
-                except PlaywrightTimeoutError:
-                    return ReplyCheckResult(
-                        has_reply=False,
-                        error="кнопка «Написать сообщение» недоступна — переписку не открыть",
-                    )
-                chat_href = send_btn.get_attribute("href")
-                resolved_href = chat_href
-                page.goto(urljoin(page.url, chat_href), wait_until="domcontentloaded")
-
-                try:
-                    page.wait_for_selector(_MESSAGE_ITEM_SELECTOR, timeout=20_000)
-                except PlaywrightTimeoutError:
-                    # переписки ещё нет или не успела отрисоваться
-                    return ReplyCheckResult(has_reply=False, resolved_chat_href=resolved_href)
+            try:
+                page.wait_for_selector(_MESSAGE_ITEM_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return ReplyCheckResult(has_reply=False)  # переписки ещё нет или не успела отрисоваться
 
             items = page.query_selector_all(_MESSAGE_ITEM_SELECTOR)
             if not items:
-                return ReplyCheckResult(has_reply=False, resolved_chat_href=resolved_href)
+                return ReplyCheckResult(has_reply=False)
 
             last_author_href = self._last_author_href(items)
             if last_author_href is None or not self._is_incoming(last_author_href, lead):
-                # последнее сообщение — наше собственное
-                return ReplyCheckResult(has_reply=False, resolved_chat_href=resolved_href)
+                return ReplyCheckResult(has_reply=False)  # последнее сообщение — наше собственное
 
             preview = self._last_message_text(items)
-            return ReplyCheckResult(has_reply=True, preview=preview, resolved_chat_href=resolved_href)
+            return ReplyCheckResult(has_reply=True, preview=preview)
         except Exception as exc:  # unexpected Playwright/DOM failure — не роняем весь батч
             logger.exception("reply check failed for lead %s", lead.get("id"))
             return ReplyCheckResult(has_reply=False, error=str(exc))
