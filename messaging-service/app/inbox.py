@@ -72,6 +72,13 @@ def run_inbox_check_task(account_id: str, limit: int = _DEFAULT_CHECK_LIMIT) -> 
     try:
         messages = client.list_messages(account_id=account_id)
         pending = [m for m in messages if m["delivery_status"] == "sent" and m["reply_status"] != "replied"]
+        # list_messages отдаёт сообщения по возрастанию sent_at (самые старые первые) — простой
+        # pending[:limit] раз за разом резал бы одну и ту же голову списка: проверенное "no_reply"
+        # сообщение остаётся в pending (ответ мог прийти позже) и по-прежнему самое старое, поэтому
+        # свежие "none" (ещё ни разу не проверенные) сообщения из хвоста списка никогда не доходили
+        # бы до лимита. Ставим ещё не проверенные вперёд — стабильная сортировка сохраняет
+        # sent_at-порядок внутри каждой группы.
+        pending.sort(key=lambda m: m["reply_status"] != "none")
         pending = pending[:limit]
         if not pending:
             task.status = InboxCheckStatus.done

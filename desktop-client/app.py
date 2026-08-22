@@ -146,12 +146,21 @@ class App(tk.Tk):
         self._messages_win: tk.Toplevel | None = None
         self._messages_tree: ttk.Treeview | None = None
         self._message_reply_text: scrolledtext.ScrolledText | None = None
+        self._errors_tree: ttk.Treeview | None = None
+        self._replies_tree: ttk.Treeview | None = None
+        self._messages_notebook: ttk.Notebook | None = None
+        self._messages_error_tab: ttk.Frame | None = None
+        self._messages_replies_tab: ttk.Frame | None = None
         # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
         # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
         self._message_links: dict[str, str] = {}
         # message_id -> полный текст ответа (в таблице колонка "Текст ответа" всё равно обрежется
         # по ширине ячейки — полный текст показываем в textarea под таблицей по выбору строки).
         self._message_reply_texts: dict[str, str] = {}
+        # message_id новых ответов, которые уже просмотрели (кликнули по строке) — такие больше
+        # не подсвечиваем синим при перезагрузке таблицы (см. _load_messages/_on_message_row_selected).
+        # Живёт только в памяти клиента на время сессии — reply_status "replied" в БД не трогаем.
+        self._acknowledged_reply_ids: set[str] = set()
         # логин -> account_id для комбобокса выбора аккаунта в окне "Кому написали"
         # (проверка входящих запускается за конкретный аккаунт — своя переписка/сессия).
         self._account_id_by_login: dict[str, str] = {}
@@ -999,8 +1008,36 @@ class App(tk.Tk):
         self.inbox_check_status = ttk.Label(inbox_bar, text="", foreground="#777")
         self.inbox_check_status.pack(side="left", padx=(10, 0))
 
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+        all_tab = ttk.Frame(notebook)
+        error_tab = ttk.Frame(notebook)
+        replies_tab = ttk.Frame(notebook)
+        notebook.add(all_tab, text="Отправленные")
+        notebook.add(error_tab, text="Ошибки")
+        notebook.add(replies_tab, text="Ответили")
+        self._messages_notebook = notebook
+        self._messages_error_tab = error_tab
+        self._messages_replies_tab = replies_tab
+
+        self._messages_tree = self._build_messages_tree(all_tab)
+        self._errors_tree = self._build_messages_tree(error_tab)
+        self._replies_tree = self._build_messages_tree(replies_tab)
+
+        reply_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
+        reply_frame.pack(fill="x")
+        ttk.Label(reply_frame, text="Текст ответа:").pack(anchor="w")
+        reply_text = scrolledtext.ScrolledText(reply_frame, height=5, wrap="word")
+        reply_text.configure(state="disabled")
+        reply_text.pack(fill="x", pady=(2, 0))
+        self._message_reply_text = reply_text
+
+        self._refresh_message_account_choices()
+        self._load_messages()
+
+    def _build_messages_tree(self, parent: ttk.Frame) -> ttk.Treeview:
         cols = ("date", "campaign", "title", "group_url", "status", "reply", "reply_text", "error")
-        tree = ttk.Treeview(win, columns=cols, show="headings")
+        tree = ttk.Treeview(parent, columns=cols, show="headings")
         for col, title, width in (
             ("date", "Когда", 120),
             ("campaign", "Кампания", 100),
@@ -1015,26 +1052,31 @@ class App(tk.Tk):
             tree.column(col, width=width, anchor="w")
         tree.tag_configure("sent", foreground="#2e9e4f")
         tree.tag_configure("failed", foreground="#c0392b")
-        tree.tag_configure("replied", foreground="#2f5ad0")
-        tree.pack(fill="both", expand=True, padx=10, pady=(4, 4))
-        tree.bind("<Double-1>", lambda _event: self._open_selected_message_link())
-        tree.bind("<<TreeviewSelect>>", lambda _event: self._on_message_row_selected())
-        self._messages_tree = tree
+        tree.tag_configure("replied", background="#3a6df0", foreground="white")
+        tree.pack(fill="both", expand=True)
+        tree.bind("<Double-1>", lambda _event, t=tree: self._open_selected_message_link(t))
+        tree.bind("<<TreeviewSelect>>", lambda _event, t=tree: self._on_message_row_selected(t))
+        return tree
 
-        reply_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
-        reply_frame.pack(fill="x")
-        ttk.Label(reply_frame, text="Текст ответа:").pack(anchor="w")
-        reply_text = scrolledtext.ScrolledText(reply_frame, height=5, wrap="word")
-        reply_text.configure(state="disabled")
-        reply_text.pack(fill="x", pady=(2, 0))
-        self._message_reply_text = reply_text
-
-        self._refresh_message_account_choices()
-        self._load_messages()
+    def _active_messages_tree(self) -> ttk.Treeview | None:
+        # "Открыть ссылку" в шапке окна должна работать с той таблицей, что сейчас видна —
+        # любая из трёх вкладок, а не всегда с первой (см. _build_messages_tree, который создаёт
+        # все таблицы одинаковыми и биндит на них общие обработчики).
+        notebook = self._messages_notebook
+        if notebook is None:
+            return self._messages_tree
+        current = notebook.select()
+        if self._messages_error_tab is not None and current == str(self._messages_error_tab):
+            return self._errors_tree
+        if self._messages_replies_tab is not None and current == str(self._messages_replies_tab):
+            return self._replies_tree
+        return self._messages_tree
 
     def _load_messages(self) -> None:
         tree = self._messages_tree
-        if tree is None:
+        errors_tree = self._errors_tree
+        replies_tree = self._replies_tree
+        if tree is None or errors_tree is None or replies_tree is None:
             return
 
         def fetch():
@@ -1053,8 +1095,12 @@ class App(tk.Tk):
             campaign_names = {c["id"]: c["name"] for c in campaigns}
 
             tree.delete(*tree.get_children())
+            errors_tree.delete(*errors_tree.get_children())
+            replies_tree.delete(*replies_tree.get_children())
             self._message_links = {}
             self._message_reply_texts = {}
+            error_count = 0
+            reply_count = 0
             for m in sorted(messages, key=lambda m: m["sent_at"], reverse=True):
                 lead = leads_by_id.get(m["lead_id"], {})
                 title = lead.get("title") or "-"
@@ -1065,44 +1111,58 @@ class App(tk.Tk):
                 reply_status = m.get("reply_status", "none")
                 reply_text = RU_REPLY_STATUS.get(reply_status, reply_status)
                 when = (m.get("sent_at") or "")[:16].replace("T", " ")
-                # replied — самое заметное (это и есть входящее сообщение), иначе как раньше:
-                # failed/sent по статусу доставки.
-                if reply_status == "replied":
+                # replied — самое заметное (это и есть входящее сообщение), пока строку не
+                # просмотрели (см. _on_message_row_selected); иначе как раньше: failed/sent по
+                # статусу доставки.
+                if reply_status == "replied" and m["id"] not in self._acknowledged_reply_ids:
                     tag = "replied"
                 else:
                     tag = "sent" if status == "sent" else "failed"
-                tree.insert(
-                    "", "end", iid=m["id"],
-                    values=(
-                        when, campaign_name, title, group_url, status_text,
-                        reply_text, m.get("reply_preview") or "", m.get("error_reason") or "",
-                    ),
-                    tags=(tag,),
+                row_values = (
+                    when, campaign_name, title, group_url, status_text,
+                    reply_text, m.get("reply_preview") or "", m.get("error_reason") or "",
                 )
+                if status == "failed":
+                    errors_tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
+                    error_count += 1
+                elif reply_status == "replied":
+                    replies_tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
+                    reply_count += 1
+                else:
+                    tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
                 self._message_links[m["id"]] = group_url
                 self._message_reply_texts[m["id"]] = m.get("reply_preview") or ""
 
-            self._on_message_row_selected()
+            if self._messages_notebook is not None and self._messages_error_tab is not None:
+                self._messages_notebook.tab(self._messages_error_tab, text=f"Ошибки ({error_count})")
+            if self._messages_notebook is not None and self._messages_replies_tab is not None:
+                self._messages_notebook.tab(self._messages_replies_tab, text=f"Ответили ({reply_count})")
+            self._on_message_row_selected(self._active_messages_tree())
 
         def error(exc):
             self.flash_status(f"Не удалось загрузить сообщения: {exc}", is_err=True)
 
         self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="messages")
 
-    def _on_message_row_selected(self) -> None:
-        tree = self._messages_tree
+    def _on_message_row_selected(self, tree: ttk.Treeview | None = None) -> None:
+        tree = tree if tree is not None else self._active_messages_tree()
         reply_text = self._message_reply_text
         if tree is None or reply_text is None or not reply_text.winfo_exists():
             return
         selected = tree.selection()
         text = self._message_reply_texts.get(selected[0], "") if selected else ""
+        if selected:
+            message_id = selected[0]
+            if "replied" in tree.item(message_id, "tags"):
+                self._acknowledged_reply_ids.add(message_id)
+                tree.item(message_id, tags=("sent",))
         reply_text.configure(state="normal")
         reply_text.delete("1.0", "end")
         reply_text.insert("1.0", text)
         reply_text.configure(state="disabled")
 
-    def _open_selected_message_link(self) -> None:
-        tree = self._messages_tree
+    def _open_selected_message_link(self, tree: ttk.Treeview | None = None) -> None:
+        tree = tree if tree is not None else self._active_messages_tree()
         if tree is None:
             return
         selected = tree.selection()
