@@ -2,7 +2,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-from app.inbox import InboxCheckStatus, InboxCheckTask, create_task, get_task, run_inbox_check_task
+from app.inbox import (
+    _DEFAULT_CHECK_LIMIT,
+    InboxCheckStatus,
+    InboxCheckTask,
+    create_task,
+    get_task,
+    run_inbox_check_task,
+)
 from app.schemas.inbox import InboxCheckStatusOut
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
@@ -16,6 +23,7 @@ def _to_out(task: InboxCheckTask) -> InboxCheckStatusOut:
         total=task.total,
         replied=task.replied,
         error=task.error,
+        has_more=task.has_more,
         results=[
             {
                 "message_id": r.message_id,
@@ -30,7 +38,9 @@ def _to_out(task: InboxCheckTask) -> InboxCheckStatusOut:
 
 
 @router.post("/check", status_code=202, response_model=InboxCheckStatusOut)
-def start_check(account_id: UUID, background_tasks: BackgroundTasks, limit: int = 20) -> InboxCheckStatusOut:
+def start_check(
+    account_id: UUID, background_tasks: BackgroundTasks, limit: int | None = _DEFAULT_CHECK_LIMIT
+) -> InboxCheckStatusOut:
     key = str(account_id)
     existing = get_task(key)
     if existing is not None and existing.status == InboxCheckStatus.running:

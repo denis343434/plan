@@ -18,4 +18,5 @@ class InboxCheckStatusOut(BaseModel):
     total: int = 0
     replied: int = 0
     error: str | None = None
+    has_more: bool = False
     results: list[InboxCheckResultItem] = []

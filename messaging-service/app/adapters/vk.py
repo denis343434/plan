@@ -298,11 +298,17 @@ class VkInboxAdapter:
             # input — так же, как это делает живой пользователь.
             clickable = page.query_selector(_ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR) or switch
             clickable.click()
-            page.wait_for_timeout(1000)  # список перестраивается под фильтр не мгновенно
 
-        # Список — часть SPA и дорисовывается уже после domcontentloaded, как и всё остальное
-        # на VK — даём время осесть перед чтением.
-        page.wait_for_timeout(500)
+        # Список диалогов перестраивается под фильтр асинхронным запросом к VK, а не мгновенной
+        # DOM-фильтрацией — раньше здесь стоял фиксированный wait_for_timeout(1000+500), который
+        # систематически ловил список ещё в процессе перестройки и возвращал ПУСТОЙ (но при этом
+        # формально успешный, не None) набор заголовков. Из-за этого вызывающий код в inbox.py
+        # ни разу не уходил в фоллбэк на полный обход и молча писал reply_status=no_reply на
+        # реальные непрочитанные ответы — подтверждено логами продакшена 2026-08-22: "unread
+        # dialog list matched 0/20" в каждом без исключения запуске проверки, ни одного лога
+        # "worker starting" (сама переписка ни разу не открывалась). Ждём, пока список
+        # действительно осядет — количество элементов должно перестать меняться.
+        self._wait_for_stable_convo_list(page)
 
         titles: set[str] = set()
         for item in page.query_selector_all(_CONVO_ITEM_SELECTOR):
@@ -313,6 +319,27 @@ class VkInboxAdapter:
             if title:
                 titles.add(title)
         return titles
+
+    def _wait_for_stable_convo_list(self, page: Page) -> None:
+        """Ждёт, пока число элементов списка диалогов перестанет меняться между опросами.
+
+        Минимальная стартовая пауза нужна отдельно от опроса стабильности: сразу после клика по
+        фильтру список какое-то время всё ещё показывает СТАРОЕ (до переключения) содержимое —
+        без неё опрос успел бы застать этот старый список "стабильным" и выйти раньше, чем VK
+        вообще начал перестройку под новый фильтр.
+        """
+        page.wait_for_timeout(1000)
+
+        deadline = time.monotonic() + _SLOW_RENDER_TIMEOUT_MS / 1000
+        last_count = None
+        stable_reads = 0
+        while time.monotonic() < deadline:
+            count = len(page.query_selector_all(_CONVO_ITEM_SELECTOR))
+            stable_reads = stable_reads + 1 if count == last_count else 1
+            last_count = count
+            if stable_reads >= 3:
+                return
+            page.wait_for_timeout(400)
 
     def _check_one(self, page: Page, lead: dict) -> ReplyCheckResult:
         try:

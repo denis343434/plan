@@ -8,7 +8,15 @@ from app.exceptions import DataServiceError
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CHECK_LIMIT = 20
+# Раньше здесь стоял конечный лимит (20, потом 100) на один клик "Проверить ответы". Любое
+# конечное число ломается так же, только позже: как только у ВСЕХ pending-сообщений
+# reply_status уже не "none" (каждое хоть раз проверено), сортировка по sent_at внутри группы
+# становится статичной — один и тот же батч из самых старых "no_reply" клик за кликом
+# перепроверяется заново, а более новые (например реальный неотвеченный ЧЕБЕР/Осьминожка)
+# никогда не доходят до проверки, пока старые не станут "replied" и не освободят место. При
+# 105+ сообщениях на аккаунт это воспроизводится снова. limit=None — проверяем весь pending
+# аккаунта целиком за один клик, лимит остаётся только как ручной параметр на крайний случай.
+_DEFAULT_CHECK_LIMIT = None
 
 
 class InboxCheckStatus(StrEnum):
@@ -40,6 +48,12 @@ class InboxCheckTask:
     replied: int = 0
     results: list[InboxCheckResultItem] = field(default_factory=list)
     error: str | None = None
+    # True, только если вызывающий явно передал конечный limit и pending-очередь оказалась
+    # больше него — десктоп-клиент по умолчанию лимит не передаёт (см. limit=None в
+    # run_inbox_check_task), тогда весь pending аккаунта уходит в один батч и has_more всегда
+    # False. Флаг остаётся на случай, если limit когда-нибудь передадут явно (см. историю: с
+    # конечным limit десктоп-клиент опирался на has_more, чтобы самому дочищать очередь).
+    has_more: bool = False
 
 
 # Ключ — account_id: за один момент времени на аккаунт имеет смысл только одна проверка
@@ -57,7 +71,7 @@ def get_task(account_id: str) -> InboxCheckTask | None:
     return TASKS.get(account_id)
 
 
-def run_inbox_check_task(account_id: str, limit: int = _DEFAULT_CHECK_LIMIT) -> None:
+def run_inbox_check_task(account_id: str, limit: int | None = _DEFAULT_CHECK_LIMIT) -> None:
     """Проверяет входящие ответы на уже отправленные этим аккаунтом сообщения (фоновая задача).
 
     Берёт сообщения этого аккаунта со status=sent, у которых ещё не отмечен ответ
@@ -79,7 +93,20 @@ def run_inbox_check_task(account_id: str, limit: int = _DEFAULT_CHECK_LIMIT) -> 
         # бы до лимита. Ставим ещё не проверенные вперёд — стабильная сортировка сохраняет
         # sent_at-порядок внутри каждой группы.
         pending.sort(key=lambda m: m["reply_status"] != "none")
-        pending = pending[:limit]
+        # has_more должен означать "есть ЕЩЁ НЕ ОХВАЧЕННАЯ свежая работа", а не "весь пул pending
+        # больше лимита" — "no_reply" никогда не уходит из pending (перепроверяем на случай
+        # позднего ответа, см. докстринг выше), поэтому в стабильном состоянии он почти всегда
+        # больше limit. Если считать has_more по всему pending, автопродолжение в десктоп-клиенте
+        # зацикливается НАВСЕГДА, гоняя один и тот же no_reply-пул по кругу (подтверждено вживую —
+        # один клик "Проверить ответы" перевалил за 360 проверок при паре десятков сообщений).
+        # Считаем только "none" (ни разу не проверенные) — конечный, реально убывающий бэклог.
+        # limit=None (дефолт) означает "без лимита" — has_more всегда False, резать нечего.
+        if limit is None:
+            task.has_more = False
+        else:
+            never_checked = sum(1 for m in pending if m["reply_status"] == "none")
+            task.has_more = never_checked > limit
+            pending = pending[:limit]
         if not pending:
             task.status = InboxCheckStatus.done
             return

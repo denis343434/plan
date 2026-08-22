@@ -167,6 +167,10 @@ class App(tk.Tk):
         # account_id, для которого сейчас идёт фоновая проверка входящих (см. _poll_inbox_check) —
         # None, когда проверка не запущена; не даёт запустить вторую поверх идущей.
         self._inbox_check_account_id: str | None = None
+        # Накопленные checked/replied по всем автопродолженным батчам одной проверки (см.
+        # has_more в on_check_inbox/_poll_inbox_check) — сервер каждый батч считает с нуля
+        # (limit=20 за раз), а прогресс в статусной строке должен расти по всей очереди.
+        self._inbox_check_totals = {"checked": 0, "replied": 0}
         # campaign_id, для которой сейчас идёт повторная рассылка по ошибкам (см.
         # _poll_retry_send) — None, когда не запущена; не даёт запустить вторую поверх идущей.
         self._retry_send_campaign_id: str | None = None
@@ -1196,8 +1200,11 @@ class App(tk.Tk):
             return
 
         self._inbox_check_account_id = account_id
+        self._inbox_check_totals = {"checked": 0, "replied": 0}
         self.inbox_check_status.configure(text="запускаю проверку…")
+        self._start_inbox_check_batch(account_id)
 
+    def _start_inbox_check_batch(self, account_id: str) -> None:
         def start():
             # Messaging Service запускает проверку фоновой задачей и сразу отвечает (не ждёт
             # обхода всех переписок в реальном браузере) — прогресс опрашивается отдельно,
@@ -1228,19 +1235,36 @@ class App(tk.Tk):
                 self._inbox_check_account_id = None
                 return
             status = result["status"]
+            totals = self._inbox_check_totals
             if status in ("queued", "running"):
-                self.inbox_check_status.configure(text=f"проверяю переписки в VK… {result['checked']}/{result['total']}")
+                checked_so_far = totals["checked"] + result["checked"]
+                self.inbox_check_status.configure(text=f"проверяю переписки в VK… {checked_so_far}")
                 self.after(2000, lambda: self._poll_inbox_check(account_id))
                 return
 
-            self._inbox_check_account_id = None
             if status == "failed":
+                self._inbox_check_account_id = None
                 self.inbox_check_status.configure(text="")
                 messagebox.showerror("Входящие", result.get("error") or "не удалось проверить входящие")
                 return
 
-            self.inbox_check_status.configure(text=f"проверено {result['checked']}, новых ответов: {result['replied']}")
-            self.flash_status(f"Входящие: проверено {result['checked']}, новых ответов: {result['replied']}")
+            totals["checked"] += result["checked"]
+            totals["replied"] += result["replied"]
+            if result.get("has_more"):
+                # limit=20 за один батч (см. messaging-service/app/inbox.py) — в очереди на этот
+                # аккаунт осталось больше, сами запускаем следующий батч, не заставляя нажимать
+                # кнопку заново. Иначе пользователь видел бы "проверено 20" и решил бы, что это
+                # всё, хотя реальных pending-сообщений может быть в разы больше (см. историю с
+                # ЧЕБЕР — сообщение стояло в очереди за лимитом и не проверялось циклами).
+                self.inbox_check_status.configure(text=f"проверяю переписки в VK… {totals['checked']}, продолжаю…")
+                self._start_inbox_check_batch(account_id)
+                return
+
+            self._inbox_check_account_id = None
+            self.inbox_check_status.configure(
+                text=f"проверено {totals['checked']}, новых ответов: {totals['replied']}"
+            )
+            self.flash_status(f"Входящие: проверено {totals['checked']}, новых ответов: {totals['replied']}")
             self._load_messages()
 
         def error(exc):
