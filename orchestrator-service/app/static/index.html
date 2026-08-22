@@ -124,7 +124,7 @@
         <option value="parsing">только парсинг</option>
         <option value="messaging">только рассылка</option>
       </select>
-      <input type="number" id="accHourly" placeholder="лимит/час" value="100">
+      <input type="number" id="accHourly" placeholder="лимит/час" value="60">
       <input type="number" id="accDaily" placeholder="лимит/сутки" value="1000">
       <button type="submit">Создать</button>
     </form>
@@ -308,7 +308,7 @@ document.getElementById('accountForm').addEventListener('submit', async (ev) => 
         platform: 'vk',
         login: document.getElementById('accLogin').value,
         purpose: document.getElementById('accPurpose').value,
-        hourly_limit: Number(document.getElementById('accHourly').value) || 100,
+        hourly_limit: Number(document.getElementById('accHourly').value) || 60,
         daily_limit: Number(document.getElementById('accDaily').value) || 1000,
       }),
     });

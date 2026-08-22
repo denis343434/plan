@@ -248,7 +248,7 @@ class App(tk.Tk):
         self.acc_purpose.set(RU_PURPOSE["both"])
         self.acc_purpose.grid(row=0, column=1, padx=2)
         self.acc_hourly = ttk.Entry(form, width=6)
-        self.acc_hourly.insert(0, "100")
+        self.acc_hourly.insert(0, "60")
         self.acc_hourly.grid(row=0, column=2, padx=2)
         self.acc_daily = ttk.Entry(form, width=6)
         self.acc_daily.insert(0, "1000")
@@ -497,7 +497,7 @@ class App(tk.Tk):
             "platform": "vk",
             "login": self._value(self.acc_login),
             "purpose": RU_PURPOSE_REVERSE.get(self.acc_purpose.get(), "both"),
-            "hourly_limit": int(self._value(self.acc_hourly) or 100),
+            "hourly_limit": int(self._value(self.acc_hourly) or 60),
             "daily_limit": int(self._value(self.acc_daily) or 1000),
         }
         if not payload["login"]:
