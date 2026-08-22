@@ -796,8 +796,9 @@ class App(tk.Tk):
             # попадают лиды, у которых прошлая отправка провалилась без признаков флуда (см.
             # messaging-service/app/tasks.py:_process_lead — такие лиды НЕ переводятся в
             # "contacted", остаются "new" именно для повторной отправки), плюс любые ещё не
-            # тронутые лиды.
-            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send", method="POST")
+            # тронутые лиды. retry_failed=true явно включает уже провалившихся лидов обратно в
+            # выборку — обычный запуск кампании их больше пропускает (см. run_send_task).
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send?retry_failed=true", method="POST")
 
         def started(_result):
             self.after(500, lambda: self._poll_retry_send(campaign_id))

@@ -51,7 +51,7 @@ def get_task(campaign_id: uuid.UUID) -> SendTask | None:
     return TASKS.get(campaign_id)
 
 
-def run_send_task(campaign_id: uuid.UUID) -> None:
+def run_send_task(campaign_id: uuid.UUID, retry_failed: bool = False) -> None:
     task = TASKS[campaign_id]
     task.status = SendTaskStatus.running
 
@@ -63,9 +63,24 @@ def run_send_task(campaign_id: uuid.UUID) -> None:
             task.error = "no template configured for campaign"
             return
 
+        # Провалившийся (не по флуду) лид остаётся status=new в Data Service (см. _process_lead) —
+        # без этой проверки он подхватывался бы каждым обычным запуском кампании точно так же,
+        # как никогда не тронутый лид, и бот писал бы туда снова и снова при каждом старте.
+        # retry_failed=True (кнопка "Повторить с ошибками" в десктоп-клиенте) явно включает такие
+        # лиды обратно в выборку.
+        previously_failed_lead_ids: set[str] = set()
+        if not retry_failed:
+            previously_failed_lead_ids = {
+                m["lead_id"] for m in client.list_messages() if m["delivery_status"] == "failed"
+            }
+
         while True:
             fetched = client.list_leads(status="new", campaign_id=campaign_id, limit=_BATCH_SIZE)
-            leads = [lead for lead in fetched if lead["id"] not in task.permanently_failed_lead_ids]
+            leads = [
+                lead for lead in fetched
+                if lead["id"] not in task.permanently_failed_lead_ids
+                and lead["id"] not in previously_failed_lead_ids
+            ]
             if not leads:
                 # Либо реально закончились новые лиды, либо остались только те, что уже
                 # провалились без флуда в этом запуске (см. permanently_failed_lead_ids) —

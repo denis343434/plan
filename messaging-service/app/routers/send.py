@@ -20,13 +20,13 @@ def _to_out(task: SendTask) -> SendStatusOut:
 
 
 @router.post("/{campaign_id}/send", status_code=202, response_model=SendStatusOut)
-def start_send(campaign_id: UUID, background_tasks: BackgroundTasks) -> SendStatusOut:
+def start_send(campaign_id: UUID, background_tasks: BackgroundTasks, retry_failed: bool = False) -> SendStatusOut:
     existing = get_task(campaign_id)
     if existing is not None and existing.status == SendTaskStatus.running:
         return _to_out(existing)
 
     task = create_task(campaign_id)
-    background_tasks.add_task(run_send_task, campaign_id)
+    background_tasks.add_task(run_send_task, campaign_id, retry_failed)
     return _to_out(task)
 
 

@@ -73,6 +73,7 @@ def test_post_send_runs_task_to_done_and_status_endpoint_reflects_it():
             200, json={"id": template_id, "campaign_id": campaign_id, "variant": "A", "body": "Hi {{org_name}}"}
         )
     )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
     respx.get(f"{BASE}/leads").mock(
         side_effect=[
             httpx.Response(200, json=[_lead_payload(lead1)]),
