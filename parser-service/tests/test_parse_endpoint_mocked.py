@@ -45,6 +45,7 @@ def test_post_parse_sends_correct_bulk_payload_and_reaches_done():
             json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
         )
     )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
     bulk_route = respx.post(f"{BASE}/leads/bulk").mock(
         return_value=httpx.Response(200, json={"inserted": 3, "skipped": 0, "lead_ids": []})
     )

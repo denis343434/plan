@@ -85,12 +85,13 @@ class VkParserAdapter:
                     pass  # ни одной группы по запросу — не ошибка, просто пустой результат
 
                 if filters.max_groups is not None:
-                    self._scroll_until_enough_candidates(page, filters.max_groups)
+                    self._scroll_until_enough_new_candidates(page, filters)
 
                 candidates = [
                     lead
                     for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
                     if (lead := self._parse_card(card, filters)) is not None
+                    and lead.external_id not in filters.known_external_ids
                 ]
 
                 # filters.has_site is True — явный запрос "только с сайтом", инвертируем;
@@ -184,24 +185,38 @@ class VkParserAdapter:
         except PlaywrightTimeoutError:
             return False
 
-    def _scroll_until_enough_candidates(self, page: Page, max_groups: int) -> None:
-        # want минимум max_groups карточек в DOM, чтобы дальше было из чего проверять "есть
-        # сайт" — без этого candidates обрывался на первой подгруженной VK порции (~20).
-        loaded = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+    def _scroll_until_enough_new_candidates(self, page: Page, filters: ParseFilters) -> None:
+        # Хотим минимум max_groups карточек в DOM, которых ещё нет в known_external_ids —
+        # раньше здесь считались ВСЕ карточки без разбора, и при повторном запуске с той же
+        # выдачей VK (тот же keyword почти всегда возвращает один и тот же порядок сообществ)
+        # докрутка останавливалась на первой же порции, целиком состоящей из уже известных
+        # групп, и парсер каждый раз "находил" одно и то же вместо того, чтобы уйти дальше.
+        def count_new() -> int:
+            return sum(
+                1
+                for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
+                if (lead := self._parse_card(card, filters)) is not None
+                and lead.external_id not in filters.known_external_ids
+            )
+
+        max_groups = filters.max_groups
+        new_count = count_new()
+        total_loaded = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
         stalls = 0
         for _ in range(_MAX_SCROLL_ATTEMPTS):
-            if loaded >= max_groups:
+            if max_groups is not None and new_count >= max_groups:
                 return
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(_SCROLL_WAIT_MS)
-            current = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
-            if current == loaded:
+            current_total = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+            if current_total == total_loaded:
                 stalls += 1
                 if stalls >= _NO_GROWTH_STALLS_TO_STOP:
                     return  # несколько попыток подряд без роста — выдача действительно кончилась
                 continue
             stalls = 0
-            loaded = current
+            total_loaded = current_total
+            new_count = count_new()
 
     def _has_external_site(self, page: Page, group_url: str) -> bool:
         # Лишний реальный переход на страницу каждого кандидата — дороже по времени и риску

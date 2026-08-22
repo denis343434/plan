@@ -39,6 +39,12 @@ class DataServiceClient:
     def bulk_insert_leads(self, leads: list[dict]) -> dict:
         return self._request("POST", "/leads/bulk", json=leads).json()
 
+    def list_leads(self, platform: str | None = None, limit: int = 5000) -> list[dict]:
+        params: dict[str, Any] = {"limit": limit}
+        if platform is not None:
+            params["platform"] = platform
+        return self._request("GET", "/leads", params=params).json()
+
     def next_available_account(
         self,
         platform: str,

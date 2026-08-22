@@ -80,6 +80,17 @@ def run_parse_task(
             account_id = account["id"]
             session = client.get_session(account_id)
             adapter = get_adapter(platform, storage_state=session["storage_state"])
+
+            # Уже известные (по любой кампании — дедуп в Data Service глобальный по platform,
+            # см. uq_leads_platform_external_id) группы адаптер пропускает и докручивает выдачу
+            # дальше вместо того, чтобы на каждом запуске находить один и тот же верхний срез
+            # результатов поиска VK (см. ParseFilters.known_external_ids).
+            try:
+                parse_filters.known_external_ids = frozenset(
+                    lead["external_id"] for lead in client.list_leads(platform=platform)
+                )
+            except DataServiceError:
+                logger.exception("failed to fetch known leads for dedup-aware parsing, proceeding without it")
         else:
             adapter = get_adapter(platform)
 

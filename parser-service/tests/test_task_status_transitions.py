@@ -45,6 +45,7 @@ def test_vk_task_goes_queued_running_done_via_fake_adapter():
             json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
         )
     )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
     bulk_route = respx.post(f"{BASE}/leads/bulk").mock(
         return_value=httpx.Response(
             200, json={"inserted": 3, "skipped": 0, "lead_ids": [str(uuid.uuid4()) for _ in range(3)]}
@@ -93,6 +94,7 @@ def test_captcha_cooldowns_account_and_does_not_release_it(monkeypatch):
             json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
         )
     )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
     respx.post(f"{BASE}/leads/bulk").mock(
         return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
     )
@@ -115,6 +117,65 @@ def test_captcha_cooldowns_account_and_does_not_release_it(monkeypatch):
     assert task.status == TaskStatus.failed
     assert cooldown_route.called
     assert not release_route.called
+
+
+@respx.mock
+def test_vk_task_passes_known_external_ids_to_adapter(monkeypatch):
+    """Регрессия: без known_external_ids парсер каждый раз находит один и тот же верхний срез
+    выдачи VK для одного keyword — адаптер должен получать список уже известных групп, чтобы
+    докручивать выдачу дальше вместо повторной обработки того же среза."""
+    account_id = str(uuid.uuid4())
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    respx.get(f"{BASE}/leads").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(uuid.uuid4()),
+                    "platform": "vk",
+                    "external_id": "already_known_group",
+                    "group_url": "https://vk.com/already_known_group",
+                    "admin_contact": None,
+                    "title": "Known",
+                    "status": "new",
+                    "campaign_id": None,
+                    "found_at": "2026-01-01T00:00:00",
+                }
+            ],
+        )
+    )
+    respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    captured_filters = {}
+
+    class _CapturingAdapter:
+        def search_communities(self, keyword, filters, on_progress=None):
+            captured_filters["filters"] = filters
+            if on_progress is not None:
+                on_progress(0, 0, 0)
+            return []
+
+    monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _CapturingAdapter())
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None)
+
+    assert task.status == TaskStatus.done
+    assert captured_filters["filters"].known_external_ids == frozenset({"already_known_group"})
+    assert release_route.called
 
 
 def test_stub_platform_task_completes_done_without_touching_accounts():
