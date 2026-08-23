@@ -30,6 +30,11 @@ def list_leads(
     )
 
 
+@router.get("/{lead_id}", response_model=LeadOut)
+def get_lead(lead_id: UUID, db: Session = Depends(get_db)) -> LeadOut:
+    return crud.get_lead(db, lead_id)
+
+
 @router.patch("/{lead_id}/status", response_model=LeadOut)
 def update_lead_status(
     lead_id: UUID, update: LeadStatusUpdate, db: Session = Depends(get_db)

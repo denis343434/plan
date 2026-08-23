@@ -54,6 +54,17 @@ class DataServiceClient:
             params["campaign_id"] = str(campaign_id)
         return self._request("GET", "/leads", params=params).json()
 
+    def get_lead(self, lead_id: str) -> dict:
+        return self._request("GET", f"/leads/{lead_id}").json()
+
+    def lock_account(
+        self, account_id: str, lock_ttl_seconds: int = 900, task_ref: str | None = None
+    ) -> dict:
+        params: dict[str, Any] = {"lock_ttl_seconds": lock_ttl_seconds}
+        if task_ref is not None:
+            params["task_ref"] = task_ref
+        return self._request("POST", f"/accounts/{account_id}/lock", params=params).json()
+
     def next_available_account(
         self,
         platform: str,

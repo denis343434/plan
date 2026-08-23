@@ -7,7 +7,9 @@ localhost:8001-8004). Запуск: python app.py (из этой папки), п
 `docker compose up` в корне репозитория.
 """
 
+import base64
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -18,7 +20,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 # Локальный "гейт" перед панелью — не серьёзная аутентификация (сами API Data/Parser/
 # Messaging/Orchestrator по-прежнему открыты на localhost без какой-либо проверки), а просто
@@ -39,6 +41,10 @@ ORCHESTRATOR_URL = f"http://{HOST}:8004"
 
 REFRESH_LIST_MS = 8000
 REFRESH_DETAIL_MS = 3000
+
+# Держим в шаге с MAX_IMAGE_BYTES в messaging-service/app/schemas/reply.py — проверяем на
+# клиенте до отправки, чтобы не гонять base64 через сеть только затем, чтобы сервер его отклонил.
+MAX_REPLY_IMAGE_BYTES = 15 * 1024 * 1024
 
 RU_SERVICE_NAME = {
     "data-service": "БД-сервис",
@@ -146,6 +152,8 @@ class App(tk.Tk):
         self._messages_win: tk.Toplevel | None = None
         self._messages_tree: ttk.Treeview | None = None
         self._message_reply_text: scrolledtext.ScrolledText | None = None
+        self._reply_compose_text: tk.Text | None = None
+        self.reply_send_button: ttk.Button | None = None
         self._errors_tree: ttk.Treeview | None = None
         self._replies_tree: ttk.Treeview | None = None
         self._messages_notebook: ttk.Notebook | None = None
@@ -154,9 +162,13 @@ class App(tk.Tk):
         # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
         # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
         self._message_links: dict[str, str] = {}
-        # message_id -> полный текст ответа (в таблице колонка "Текст ответа" всё равно обрежется
-        # по ширине ячейки — полный текст показываем в textarea под таблицей по выбору строки).
-        self._message_reply_texts: dict[str, str] = {}
+        # lead_id -> все сообщения этого лида (все аккаунты/кампании разом) — по выбору строки
+        # рисуем под таблицей мини-чат: своё сообщение + его ответ, друг за другом по sent_at
+        # (см. _render_lead_chat/_load_messages).
+        self._messages_by_lead: dict[str, list[dict]] = {}
+        # message_id -> {"lead_id", "account_id"} — нужно кнопке "Ответить": отвечать обязаны с
+        # того же аккаунта, что вёл переписку с этой группой (см. on_send_reply).
+        self._message_reply_targets: dict[str, dict] = {}
         # message_id новых ответов, которые уже просмотрели (кликнули по строке) — такие больше
         # не подсвечиваем синим при перезагрузке таблицы (см. _load_messages/_on_message_row_selected).
         # Живёт только в памяти клиента на время сессии — reply_status "replied" в БД не трогаем.
@@ -174,6 +186,13 @@ class App(tk.Tk):
         # campaign_id, для которой сейчас идёт повторная рассылка по ошибкам (см.
         # _poll_retry_send) — None, когда не запущена; не даёт запустить вторую поверх идущей.
         self._retry_send_campaign_id: str | None = None
+        # message_id, для которого сейчас отправляется ручной ответ — None, когда не идёт
+        # отправка; не даёт запустить вторую поверх идущей (см. on_send_reply).
+        self._reply_send_message_id: str | None = None
+        # Путь к картинке, выбранной для прикрепления к следующему ручному ответу — None, если
+        # ничего не выбрано (см. on_pick_reply_attachment/on_send_reply).
+        self._reply_attachment_path: str | None = None
+        self.reply_attachment_label: ttk.Label | None = None
 
         self._install_clipboard_shortcuts()
         self._build_layout()
@@ -1031,11 +1050,44 @@ class App(tk.Tk):
 
         reply_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
         reply_frame.pack(fill="x")
-        ttk.Label(reply_frame, text="Текст ответа:").pack(anchor="w")
-        reply_text = scrolledtext.ScrolledText(reply_frame, height=5, wrap="word")
+        ttk.Label(reply_frame, text="Переписка с этим лидом:").pack(anchor="w")
+        reply_text = scrolledtext.ScrolledText(reply_frame, height=10, wrap="word", background="#fafafa")
         reply_text.configure(state="disabled")
         reply_text.pack(fill="x", pady=(2, 0))
+        # Имитация чата VK: наши сообщения — справа на голубом, ответы лида — слева на сером.
+        # Text не рисует настоящие "пузыри" со скруглением — background на всю ширину строки
+        # плюс отступы полями (lmargin/rmargin) это приемлемо имитируют для десктоп-таблицы.
+        reply_text.tag_configure(
+            "out_bubble", justify="right", background="#dbeafe",
+            lmargin1=60, lmargin2=60, rmargin=8, spacing1=1, spacing3=8,
+        )
+        reply_text.tag_configure(
+            "in_bubble", justify="left", background="#e9e9e9",
+            lmargin1=8, lmargin2=8, rmargin=60, spacing1=1, spacing3=8,
+        )
+        reply_text.tag_configure("out_meta", justify="right", foreground="#888", font=("Segoe UI", 8), rmargin=8)
+        reply_text.tag_configure("in_meta", justify="left", foreground="#888", font=("Segoe UI", 8), lmargin1=8)
         self._message_reply_text = reply_text
+
+        compose_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
+        compose_frame.pack(fill="x")
+        ttk.Label(compose_frame, text="Ответить (с того же аккаунта):").pack(anchor="w")
+        compose_row = ttk.Frame(compose_frame)
+        compose_row.pack(fill="x", pady=(2, 0))
+        compose_text = tk.Text(compose_row, height=3, wrap="word")
+        compose_text.pack(side="left", fill="x", expand=True)
+        self._reply_compose_text = compose_text
+        self.reply_send_button = ttk.Button(
+            compose_row, text="Ответить", style="Accent.TButton", command=self.on_send_reply
+        )
+        self.reply_send_button.pack(side="left", padx=(6, 0), anchor="n")
+
+        attach_row = ttk.Frame(compose_frame)
+        attach_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(attach_row, text="Прикрепить фото", command=self.on_pick_reply_attachment).pack(side="left")
+        ttk.Button(attach_row, text="Убрать", command=self.on_clear_reply_attachment).pack(side="left", padx=(6, 0))
+        self.reply_attachment_label = ttk.Label(attach_row, text="файл не выбран", foreground="#777")
+        self.reply_attachment_label.pack(side="left", padx=(8, 0))
 
         self._refresh_message_account_choices()
         self._load_messages()
@@ -1103,7 +1155,10 @@ class App(tk.Tk):
             errors_tree.delete(*errors_tree.get_children())
             replies_tree.delete(*replies_tree.get_children())
             self._message_links = {}
-            self._message_reply_texts = {}
+            self._message_reply_targets = {}
+            self._messages_by_lead = {}
+            for m in messages:
+                self._messages_by_lead.setdefault(m["lead_id"], []).append(m)
             error_count = 0
             reply_count = 0
             for m in sorted(messages, key=lambda m: m["sent_at"], reverse=True):
@@ -1136,7 +1191,7 @@ class App(tk.Tk):
                 else:
                     tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
                 self._message_links[m["id"]] = group_url
-                self._message_reply_texts[m["id"]] = m.get("reply_preview") or ""
+                self._message_reply_targets[m["id"]] = {"lead_id": m["lead_id"], "account_id": m["account_id"]}
 
             if self._messages_notebook is not None and self._messages_error_tab is not None:
                 self._messages_notebook.tab(self._messages_error_tab, text=f"Ошибки ({error_count})")
@@ -1151,20 +1206,50 @@ class App(tk.Tk):
 
     def _on_message_row_selected(self, tree: ttk.Treeview | None = None) -> None:
         tree = tree if tree is not None else self._active_messages_tree()
-        reply_text = self._message_reply_text
-        if tree is None or reply_text is None or not reply_text.winfo_exists():
+        if tree is None:
             return
         selected = tree.selection()
-        text = self._message_reply_texts.get(selected[0], "") if selected else ""
+        lead_id = None
         if selected:
             message_id = selected[0]
             if "replied" in tree.item(message_id, "tags"):
                 self._acknowledged_reply_ids.add(message_id)
                 tree.item(message_id, tags=("sent",))
-        reply_text.configure(state="normal")
-        reply_text.delete("1.0", "end")
-        reply_text.insert("1.0", text)
-        reply_text.configure(state="disabled")
+            target = self._message_reply_targets.get(message_id)
+            lead_id = target["lead_id"] if target else None
+        self._render_lead_chat(lead_id)
+
+    def _render_lead_chat(self, lead_id: str | None) -> None:
+        """Мини-чат под таблицей — все сообщения этого лида (по всем аккаунтам/кампаниям)
+        друг за другом по времени, наши справа/голубым, ответы лида слева/серым, как в VK."""
+        chat = self._message_reply_text
+        if chat is None or not chat.winfo_exists():
+            return
+
+        chat.configure(state="normal")
+        chat.delete("1.0", "end")
+        if not lead_id:
+            chat.configure(state="disabled")
+            return
+
+        entries: list[tuple[str, str, str]] = []
+        for m in self._messages_by_lead.get(lead_id, []):
+            sent_at = (m.get("sent_at") or "")
+            entries.append((sent_at, "out", m.get("text_sent") or ""))
+            if m.get("reply_preview"):
+                replied_at = m.get("replied_at") or sent_at
+                entries.append((replied_at, "in", m["reply_preview"]))
+        entries.sort(key=lambda e: e[0])
+
+        for i, (ts, side, text) in enumerate(entries):
+            if i > 0:
+                chat.insert("end", "\n")
+            label = "Мы" if side == "out" else "Лид"
+            when = ts[:16].replace("T", " ")
+            chat.insert("end", f"{label} · {when}\n", (f"{side}_meta",))
+            chat.insert("end", f"{text}\n", (f"{side}_bubble",))
+
+        chat.configure(state="disabled")
 
     def _open_selected_message_link(self, tree: ttk.Treeview | None = None) -> None:
         tree = tree if tree is not None else self._active_messages_tree()
@@ -1179,6 +1264,93 @@ class App(tk.Tk):
             messagebox.showinfo("Кому написали", "У этой записи нет ссылки на группу")
             return
         webbrowser.open(url)
+
+    def on_send_reply(self) -> None:
+        tree = self._active_messages_tree()
+        compose_text = self._reply_compose_text
+        if tree is None or compose_text is None:
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Ответить", "Сначала выберите строку в таблице")
+            return
+        message_id = selected[0]
+        target = self._message_reply_targets.get(message_id)
+        if not target:
+            messagebox.showinfo("Ответить", "Для этой записи не найдены лид/аккаунт")
+            return
+        text = compose_text.get("1.0", "end").strip()
+        attachment_path = self._reply_attachment_path
+        if not text and not attachment_path:
+            messagebox.showinfo("Ответить", "Введите текст ответа или прикрепите файл")
+            return
+        if self._reply_send_message_id is not None:
+            messagebox.showinfo("Ответить", "Отправка ответа уже идёт, дождитесь её окончания")
+            return
+        if attachment_path and os.path.getsize(attachment_path) > MAX_REPLY_IMAGE_BYTES:
+            messagebox.showerror("Ответить", "Файл слишком большой (максимум 15 МБ)")
+            return
+
+        self._reply_send_message_id = message_id
+        self.reply_send_button.configure(state="disabled")
+        self.flash_status("Отправляю ответ…")
+
+        def start():
+            body = {"account_id": target["account_id"], "text": text}
+            if attachment_path:
+                with open(attachment_path, "rb") as f:
+                    body["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+                body["image_filename"] = os.path.basename(attachment_path)
+            return api_request(
+                MESSAGING_URL,
+                f"/leads/{target['lead_id']}/reply",
+                method="POST",
+                body=body,
+                timeout=90.0 if attachment_path else 45.0,
+            )
+
+        def done(result):
+            self._reply_send_message_id = None
+            if self.reply_send_button.winfo_exists():
+                self.reply_send_button.configure(state="normal")
+            if result.get("delivery_status") == "sent":
+                if compose_text.winfo_exists():
+                    compose_text.delete("1.0", "end")
+                self._clear_reply_attachment()
+                self.flash_status("Ответ отправлен")
+            else:
+                self.flash_status(
+                    f"Не удалось отправить ответ: {result.get('error_reason') or 'неизвестная ошибка'}",
+                    is_err=True,
+                )
+            self._load_messages()
+
+        def error(exc):
+            self._reply_send_message_id = None
+            if self.reply_send_button.winfo_exists():
+                self.reply_send_button.configure(state="normal")
+            messagebox.showerror("Ответить", str(exc))
+
+        self.run_bg(start, on_done=done, on_error=error)
+
+    def on_pick_reply_attachment(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Выбрать изображение",
+            filetypes=[("Изображения", "*.png *.jpg *.jpeg *.gif *.webp"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        self._reply_attachment_path = path
+        if self.reply_attachment_label is not None:
+            self.reply_attachment_label.configure(text=os.path.basename(path), foreground="black")
+
+    def on_clear_reply_attachment(self) -> None:
+        self._clear_reply_attachment()
+
+    def _clear_reply_attachment(self) -> None:
+        self._reply_attachment_path = None
+        if self.reply_attachment_label is not None and self.reply_attachment_label.winfo_exists():
+            self.reply_attachment_label.configure(text="файл не выбран", foreground="#777")
 
     def _refresh_message_account_choices(self) -> None:
         # Только messaging/both — у "чисто парсинговых" аккаунтов отправленных сообщений

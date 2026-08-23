@@ -37,6 +37,20 @@ _SEND_BUTTON_SELECTOR = ".ConvoComposer__sendButton--submit"
 _CAPTCHA_SELECTOR = "div.captcha, form[action*='captcha'], div.im-page--service-message"
 _FLOOD_TEXT_MARKERS = ("много сообщений", "flood", "captcha")
 
+# ВНИМАНИЕ: в отличие от остальных селекторов этого файла, эти НЕ проверены вживую — прикрепление
+# фото к ручному ответу (app/reply.py) добавлено без доступа к реальному залогиненному VK-аккаунту
+# для проверки. Это типовая разметка VKUI-composer'а, подобранная по аналогии; если прикрепление
+# не срабатывает на реальном прогоне — открыть страницу с VK_HEADLESS=false, найти актуальную
+# разметку через devtools и обновить константы + этот комментарий по образцу остальных в файле.
+_ATTACH_BUTTON_SELECTOR = (
+    '[data-testid="attach_button"], .ConvoComposer__attachIcon, .ConvoComposer__attachButton, '
+    'button[aria-label*="рикреп" i]'
+)
+_FILE_INPUT_SELECTOR = 'input[type="file"]'
+_ATTACHMENT_PREVIEW_SELECTOR = (
+    '.ComposerAttachment, .ConvoComposer__attachment, [data-testid="composer_attachment"]'
+)
+
 # Проверено вживую 2026-08-21 через реальный залогиненный аккаунт (переписка с ответившим
 # сообществом). Переписка с сообществом (business-messaging, не личный диалог) рендерится VK
 # в "безбабловом" ("WithoutBubble") стиле — плоский список строк с аватаркой+именем автора,
@@ -72,13 +86,27 @@ _MESSAGE_TEXT_SELECTOR = ".ConvoMessageWithoutBubble__text"
 #     <h3 class="ConvoTitle__author" title="Тренажерный зал «YaGOda» Южный город">...</h3>
 #     ...
 #   </div>
-# title у .ConvoTitle__author совпадает с lead["title"], который уже сохранён в базе при
-# парсинге — сопоставляем по нему, без доп. запросов на резолв id. Пользователь подтвердил
-# вживую: просто открыть vk.com/im, не кликая в чат, счётчики непрочитанных НЕ сбрасывает.
+# Раньше диалоги из этого списка сопоставлялись с лидами по тексту заголовка (title у
+# .ConvoTitle__author vs lead["title"], сохранённый при парсинге) — ненадёжно: заголовок
+# диалога и headline страницы сообщества извлекаются в разных местах разными селекторами и
+# регулярно расходятся текстом (пробелы/регистр/обрезка), из-за чего реальные новые ответы
+# молча помечались "нет ответа" без единого похода в саму переписку — подтверждено логами
+# 2026-08-23 ("unread dialog list matched 2/62"). Теперь по этому списку идём напрямую: кликаем
+# по каждому .ConvoList__item (как обычный пользователь — открыть его иначе нельзя, прямого
+# href на конкретный диалог в разметке списка нет), читаем последнее сообщение и сопоставляем
+# лида по href автора (тот же надёжный признак, что и в _check_one/_is_incoming), а не по
+# тексту. Пользователь подтвердил вживую: просто открыть vk.com/im, не кликая в чат, счётчики
+# непрочитанных НЕ сбрасывает — но сам клик по диалогу, разумеется, сбрасывает бейдж именно у
+# него, поэтому список нужно перечитывать заново после каждого клика (см. _walk_unread_dialogs).
 _ONLY_UNREAD_SWITCH_SELECTOR = '.ConvoList__footer input[role="switch"]'
 _ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR = ".ConvoList__footer .vkuiSwitch__host"
 _CONVO_ITEM_SELECTOR = ".ConvoList__item"
-_CONVO_TITLE_SELECTOR = ".ConvoTitle__author"
+
+# Сколько подряд опросов пустого (0 элементов) списка диалогов нужно, прежде чем поверить, что
+# непрочитанных действительно нет — см. докстринг _wait_for_stable_convo_list. Заметно больше,
+# чем порог в 3 для непустого списка: пустой DOM сразу после переключения фильтра — самый частый
+# ложный "стабильный" результат, реальные элементы VK досылает асинхронно с задержкой.
+_STABLE_EMPTY_READS_REQUIRED = 15
 
 
 def _sleep_random() -> None:
@@ -89,7 +117,7 @@ class VkSendAdapter:
     def __init__(self, storage_state: dict) -> None:
         self._storage_state = storage_state
 
-    def send_message(self, lead: dict, account: dict, text: str) -> SendResult:
+    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
@@ -126,6 +154,15 @@ class VkSendAdapter:
                         success=False,
                         error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер VK)",
                     )
+                if image is not None:
+                    if not self._attach_image(page, image):
+                        return SendResult(
+                            success=False,
+                            error="не удалось прикрепить изображение — не найден элемент загрузки файла "
+                            "в редакторе сообщения (селекторы не подтверждены вживую, см. комментарий "
+                            "у _ATTACH_BUTTON_SELECTOR)",
+                        )
+
                 page.click(_MESSAGE_INPUT_SELECTOR)
                 _sleep_random()
                 self._type_like_human(page, text)
@@ -161,6 +198,39 @@ class VkSendAdapter:
     def _type_like_human(self, page: Page, text: str) -> None:
         for char in text:
             page.type(_MESSAGE_INPUT_SELECTOR, char, delay=random.uniform(30, 120))
+
+    def _attach_image(self, page: Page, image: dict) -> bool:
+        """image — Playwright FilePayload: {"name", "mimeType", "buffer"}. Возвращает False, если
+        не нашли ни готовый <input type="file">, ни кнопку прикрепления — см. предупреждение у
+        _ATTACH_BUTTON_SELECTOR, это не проверенный вживую путь."""
+        file_input = page.query_selector(_FILE_INPUT_SELECTOR)
+        if file_input is not None:
+            file_input.set_input_files(image)
+            self._wait_for_attachment_preview(page)
+            return True
+
+        attach_btn = page.query_selector(_ATTACH_BUTTON_SELECTOR)
+        if attach_btn is None:
+            return False
+        try:
+            with page.expect_file_chooser(timeout=_SLOW_RENDER_TIMEOUT_MS) as chooser_info:
+                attach_btn.click()
+            chooser_info.value.set_files(image)
+        except PlaywrightTimeoutError:
+            return False
+
+        self._wait_for_attachment_preview(page)
+        return True
+
+    def _wait_for_attachment_preview(self, page: Page) -> None:
+        try:
+            page.wait_for_selector(_ATTACHMENT_PREVIEW_SELECTOR, timeout=15_000)
+        except PlaywrightTimeoutError:
+            pass
+        # Сам предпросмотр может дорисоваться позже контейнера, а точный признак "загрузка
+        # завершена" не подтверждён вживую — доп. пауза как подстраховка (см. предупреждение
+        # у _ATTACH_BUTTON_SELECTOR).
+        time.sleep(2.0)
 
 
 class VkInboxAdapter:
@@ -202,28 +272,41 @@ class VkInboxAdapter:
 
         leads_to_check = leads
         if settings.INBOX_CHECK_FILTER_BY_UNREAD_LIST:
-            unread_titles = self._read_unread_titles_gate()
-            if unread_titles is None:
+            leads_by_external_id: dict[str, dict] = {}
+            unidentifiable_ids: set[str] = set()
+            for lead in leads:
+                external_id = (lead.get("external_id") or "").strip("/")
+                if external_id:
+                    leads_by_external_id[external_id] = lead
+                else:
+                    # Без external_id сопоставить диалог с лидом нечем (см. _is_incoming) — не
+                    # гадаем, что "нет ответа", проверяем такого лида напрямую в полном обходе
+                    # ниже, как и раньше делали для лидов без title.
+                    unidentifiable_ids.add(lead["id"])
+
+            unread_ok = self._walk_unread_dialogs(leads_by_external_id, results, report_progress)
+            if not unread_ok:
                 logger.info(
                     "inbox check: could not read VK unread dialog list, falling back to full scan of %d lead(s)",
                     total,
                 )
+                leads_to_check = leads
             else:
-                leads_to_check = []
+                # Список непрочитанных диалогов уже пройден целиком (см. _walk_unread_dialogs) —
+                # всё, что там реально нашлось и совпало с лидом, уже в results. Остальным
+                # опознаваемым pending-лидам открывать нечего: раз их диалога не было среди
+                # непрочитанных, нового входящего у них нет.
                 for lead in leads:
-                    title = (lead.get("title") or "").strip()
-                    # Без title сопоставить с диалогом нечем — не гадаем, проверяем лида напрямую,
-                    # а не молча считаем его "без ответа".
-                    if not title or title in unread_titles:
-                        leads_to_check.append(lead)
-                    else:
+                    if lead["id"] not in unidentifiable_ids and lead["id"] not in results:
                         results[lead["id"]] = ReplyCheckResult(has_reply=False)
                         report_progress()
                 logger.info(
-                    "inbox check: unread dialog list matched %d/%d lead(s) by title, skipping the rest",
-                    len(leads_to_check),
+                    "inbox check: unread dialog walk matched %d/%d lead(s), %d without external_id go to full scan",
+                    sum(1 for r in results.values() if r.has_reply),
                     total,
+                    len(unidentifiable_ids),
                 )
+                leads_to_check = [lead for lead in leads if lead["id"] in unidentifiable_ids]
 
         if not leads_to_check:
             return results
@@ -264,69 +347,126 @@ class VkInboxAdapter:
                 future.result()
         return results
 
-    def _read_unread_titles_gate(self) -> set[str] | None:
-        """Разовая проверка списка диалогов VK — отдельная короткая Playwright-сессия в
-        вызывающем потоке, до того как запускаются потоки-воркеры для самого обхода."""
+    def _walk_unread_dialogs(
+        self,
+        leads_by_external_id: dict[str, dict],
+        results: dict[str, ReplyCheckResult],
+        report_progress: Callable[[], None],
+    ) -> bool:
+        """Открывает vk.com/im с включённым тумблером "Только непрочитанные" и последовательно
+        кликает по каждому диалогу, который VK там реально показывает — читает последнее
+        сообщение и сопоставляет автора с лидом по href (см. _is_incoming), а не по тексту
+        заголовка (см. историю выше про title-матчинг, ненадёжно). Пишет результат в `results`
+        сразу для всех совпавших лидов — отдельная короткая Playwright-сессия, до воркеров
+        полного обхода.
+
+        Возвращает False, если список диалогов вообще не удалось прочитать (страница/тумблер не
+        отрисовались) — тогда вызывающий код обязан пойти в полный обход, а не гадать.
+        """
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
             try:
-                return self._list_unread_conversation_titles(context.new_page())
+                page = context.new_page()
+                try:
+                    page.goto("https://vk.com/im", wait_until="domcontentloaded")
+                    page.wait_for_selector(_ONLY_UNREAD_SWITCH_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+                except Exception:
+                    return False  # страница/список диалогов вообще не отрисовались — не гадаем
+
+                switch = page.query_selector(_ONLY_UNREAD_SWITCH_SELECTOR)
+                if switch is not None and switch.get_attribute("aria-checked") != "true":
+                    # Кликаем по видимому визуальному переключателю, а не по спрятанному
+                    # нативному input — так же, как это делает живой пользователь.
+                    clickable = page.query_selector(_ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR) or switch
+                    clickable.click()
+
+                # Список диалогов перестраивается под фильтр асинхронным запросом к VK, а не
+                # мгновенной DOM-фильтрацией — раньше здесь стоял фиксированный
+                # wait_for_timeout(1000+500), который систематически ловил список ещё в процессе
+                # перестройки и возвращал пустой набор. Ждём, пока список действительно осядет.
+                self._wait_for_stable_convo_list(page)
+
+                seen_keys: set[str] = set()
+                # Верхняя граница на случай неожиданной разметки/зацикливания — реальных
+                # непрочитанных диалогов у одного аккаунта рассылки столько не бывает.
+                for _ in range(200):
+                    item = self._next_unseen_convo_item(page, seen_keys)
+                    if item is None:
+                        break
+                    external_id, result = self._check_one_unread_dialog(page, item)
+                    lead = leads_by_external_id.get(external_id) if external_id else None
+                    if lead is not None and lead["id"] not in results:
+                        results[lead["id"]] = result
+                        report_progress()
+                    _sleep_random()
+                    # Открытый диалог обычно пропадает из отфильтрованного списка (стал
+                    # прочитанным) — ждём, пока список снова осядет, прежде чем брать следующий.
+                    self._wait_for_stable_convo_list(page)
+                return True
             finally:
                 context.close()
                 browser.close()
 
-    def _list_unread_conversation_titles(self, page: Page) -> set[str] | None:
-        """Заголовки диалогов в списке vk.com/im, у которых есть непрочитанные сообщения.
-
-        None означает "не удалось определить" (страница/список не прогрузились) — в этом
-        случае вызывающий код обязан пойти по полному циклу, а не гадать.
-        """
-        try:
-            page.goto("https://vk.com/im", wait_until="domcontentloaded")
-        except Exception:
-            return None
-
-        try:
-            page.wait_for_selector(_ONLY_UNREAD_SWITCH_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            return None  # список диалогов вообще не отрисовался — не гадаем
-
-        switch = page.query_selector(_ONLY_UNREAD_SWITCH_SELECTOR)
-        if switch is not None and switch.get_attribute("aria-checked") != "true":
-            # Кликаем по видимому визуальному переключателю, а не по спрятанному нативному
-            # input — так же, как это делает живой пользователь.
-            clickable = page.query_selector(_ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR) or switch
-            clickable.click()
-
-        # Список диалогов перестраивается под фильтр асинхронным запросом к VK, а не мгновенной
-        # DOM-фильтрацией — раньше здесь стоял фиксированный wait_for_timeout(1000+500), который
-        # систематически ловил список ещё в процессе перестройки и возвращал ПУСТОЙ (но при этом
-        # формально успешный, не None) набор заголовков. Из-за этого вызывающий код в inbox.py
-        # ни разу не уходил в фоллбэк на полный обход и молча писал reply_status=no_reply на
-        # реальные непрочитанные ответы — подтверждено логами продакшена 2026-08-22: "unread
-        # dialog list matched 0/20" в каждом без исключения запуске проверки, ни одного лога
-        # "worker starting" (сама переписка ни разу не открывалась). Ждём, пока список
-        # действительно осядет — количество элементов должно перестать меняться.
-        self._wait_for_stable_convo_list(page)
-
-        titles: set[str] = set()
+    def _next_unseen_convo_item(self, page: Page, seen_keys: set[str]) -> ElementHandle | None:
         for item in page.query_selector_all(_CONVO_ITEM_SELECTOR):
-            title_el = item.query_selector(_CONVO_TITLE_SELECTOR)
-            if title_el is None:
-                continue
-            title = (title_el.get_attribute("title") or title_el.inner_text() or "").strip()
-            if title:
-                titles.add(title)
-        return titles
+            key = item.get_attribute("data-itemkey") or ""
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                return item
+        return None
+
+    def _check_one_unread_dialog(self, page: Page, item: ElementHandle) -> tuple[str | None, ReplyCheckResult]:
+        """Открывает диалог кликом по элементу списка (прямого href на конкретный диалог в
+        разметке списка нет — открыть иначе, чем кликом, нельзя) и читает последнее сообщение.
+        Возвращает (href автора без слэшей или None, результат) — сопоставление с лидом делает
+        вызывающий код (_walk_unread_dialogs), у него есть полный leads_by_external_id."""
+        try:
+            item.click()
+            try:
+                page.wait_for_selector(_MESSAGE_ITEM_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return None, ReplyCheckResult(
+                    has_reply=False, error="диалог открылся, но сообщения не прогрузились за 40с"
+                )
+
+            items = page.query_selector_all(_MESSAGE_ITEM_SELECTOR)
+            if not items:
+                return None, ReplyCheckResult(has_reply=False)
+
+            last_author_href = self._last_author_href(items)
+            if last_author_href is None:
+                return None, ReplyCheckResult(has_reply=False)
+
+            # Диалог в отфильтрованном "только непрочитанные" списке — значит есть непрочитанное
+            # входящее по определению VK (собственные отправленные сообщения бейдж не ставят).
+            # Если href автора последнего сообщения при этом не совпадёт ни с одним нашим
+            # external_id (см. _walk_unread_dialogs) — это либо чужая переписка не из наших
+            # лидов, либо VK не успел досчитать бейдж досюда; сопоставление отфильтрует такое
+            # само, без доп. проверки "наше/чужое" здесь.
+            preview = self._last_message_text(items)
+            return last_author_href.strip("/"), ReplyCheckResult(has_reply=True, preview=preview)
+        except Exception as exc:  # unexpected Playwright/DOM failure — не роняем весь обход
+            logger.exception("inbox check: failed to read an unread dialog from vk.com/im list")
+            return None, ReplyCheckResult(has_reply=False, error=str(exc))
 
     def _wait_for_stable_convo_list(self, page: Page) -> None:
         """Ждёт, пока число элементов списка диалогов перестанет меняться между опросами.
 
         Минимальная стартовая пауза нужна отдельно от опроса стабильности: сразу после клика по
-        фильтру список какое-то время всё ещё показывает СТАРОЕ (до переключения) содержимое —
-        без неё опрос успел бы застать этот старый список "стабильным" и выйти раньше, чем VK
-        вообще начал перестройку под новый фильтр.
+        фильтру/диалогу список какое-то время всё ещё показывает СТАРОЕ содержимое — без неё
+        опрос успел бы застать этот старый список "стабильным" и выйти раньше, чем VK вообще
+        начал перестройку.
+
+        0 — самый опасный "стабильный" результат: VK чистит DOM под новый фильтр МГНОВЕННО, а
+        сами непрочитанные диалоги подгружает отдельным асинхронным запросом с ощутимой
+        задержкой — три подряд опроса пустого списка (~1.2с) относительно легко укладываются в
+        это окно "уже пусто, но реальные элементы ещё не долетели". Подтверждено вживую
+        2026-08-23: `_walk_unread_dialogs` отработал за ~2с и решил, что непрочитанных нет,
+        хотя у VK в этот момент реально висело 3 непрочитанных диалога (см. историю выше про
+        title-матчинг — багфикс того же класса, что и тогда, просто по 0-элементам, а не по
+        тексту заголовка). Для count=0 требуем кратно больше стабильных чтений, прежде чем
+        поверить, что список действительно пуст, а не просто ещё не начал заполняться.
         """
         page.wait_for_timeout(1000)
 
@@ -337,7 +477,8 @@ class VkInboxAdapter:
             count = len(page.query_selector_all(_CONVO_ITEM_SELECTOR))
             stable_reads = stable_reads + 1 if count == last_count else 1
             last_count = count
-            if stable_reads >= 3:
+            required = 3 if count else _STABLE_EMPTY_READS_REQUIRED
+            if stable_reads >= required:
                 return
             page.wait_for_timeout(400)
 

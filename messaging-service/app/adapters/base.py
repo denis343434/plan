@@ -10,7 +10,12 @@ class SendResult:
 
 
 class SendAdapter(Protocol):
-    def send_message(self, lead: dict, account: dict, text: str) -> SendResult: ...
+    # image, если задан — Playwright FilePayload: {"name": str, "mimeType": str, "buffer": bytes}.
+    # Только для ручного ответа (см. app/reply.py) — обычная кампания текстом-по-шаблону его не
+    # передаёт, поэтому параметр опциональный со значением по умолчанию None.
+    def send_message(
+        self, lead: dict, account: dict, text: str, image: dict | None = None
+    ) -> SendResult: ...
 
 
 @dataclass

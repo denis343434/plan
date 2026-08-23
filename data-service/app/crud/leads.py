@@ -74,6 +74,13 @@ def list_leads(
     return list(db.execute(stmt).scalars().all())
 
 
+def get_lead(db: Session, lead_id: UUID) -> Lead:
+    lead = db.get(Lead, lead_id)
+    if lead is None:
+        raise NotFoundError(f"lead {lead_id} not found")
+    return lead
+
+
 def update_status(db: Session, lead_id: UUID, status: str) -> Lead:
     lead = db.get(Lead, lead_id)
     if lead is None:

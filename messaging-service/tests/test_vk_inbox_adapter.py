@@ -7,7 +7,6 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from app.adapters.base import ReplyCheckResult
 from app.adapters.vk import (
     _CONVO_ITEM_SELECTOR,
-    _CONVO_TITLE_SELECTOR,
     _MESSAGE_AUTHOR_LINK_SELECTOR,
     _MESSAGE_ITEM_SELECTOR,
     _MESSAGE_TEXT_SELECTOR,
@@ -38,30 +37,28 @@ def _make_message_item(author_href: str, text: str) -> MagicMock:
     return item
 
 
-def _make_convo_item(title: str | None) -> MagicMock:
-    title_el = None
-    if title is not None:
-        title_el = MagicMock()
-        title_el.get_attribute.return_value = title
-        title_el.inner_text.return_value = title
-
-    item = MagicMock()
-
-    def query_selector(selector: str):
-        if selector == _CONVO_TITLE_SELECTOR:
-            return title_el
-        return None
-
-    item.query_selector.side_effect = query_selector
-    return item
-
-
-def _make_im_page(switch_checked: bool, items: list[MagicMock]) -> tuple[MagicMock, MagicMock]:
-    """Мок Page для vk.com/im: тумблер "Только непрочитанные" + список диалогов."""
+def _make_im_walk_page(
+    switch_checked: bool, dialogs: list[tuple[str, list[MagicMock]]]
+) -> tuple[MagicMock, MagicMock]:
+    """Мок Page для vk.com/im: тумблер "Только непрочитанные" + список диалогов, где клик по
+    диалогу с данным data-itemkey переключает то, что вернёт query_selector_all для сообщений
+    (см. _check_one_unread_dialog — открывает диалог кликом, потом читает _MESSAGE_ITEM_SELECTOR)."""
     page = MagicMock()
     switch = MagicMock()
     switch.get_attribute.return_value = "true" if switch_checked else "false"
     clickable = MagicMock()
+
+    state = {"current_messages": []}
+    convo_items = []
+    for key, messages in dialogs:
+        convo_item = MagicMock()
+        convo_item.get_attribute.return_value = key
+
+        def _click(messages=messages):
+            state["current_messages"] = messages
+
+        convo_item.click.side_effect = _click
+        convo_items.append(convo_item)
 
     def query_selector(selector: str):
         if selector == _ONLY_UNREAD_SWITCH_SELECTOR:
@@ -70,8 +67,15 @@ def _make_im_page(switch_checked: bool, items: list[MagicMock]) -> tuple[MagicMo
             return clickable
         return None
 
+    def query_selector_all(selector: str):
+        if selector == _CONVO_ITEM_SELECTOR:
+            return convo_items
+        if selector == _MESSAGE_ITEM_SELECTOR:
+            return state["current_messages"]
+        return []
+
     page.query_selector.side_effect = query_selector
-    page.query_selector_all.return_value = items
+    page.query_selector_all.side_effect = query_selector_all
     return page, clickable
 
 
@@ -86,6 +90,20 @@ def _fake_playwright_context_manager() -> MagicMock:
     context = MagicMock()
     browser.new_context.return_value = context
     context.new_page.side_effect = lambda: MagicMock(url="https://vk.com/some_group")
+    return pw_cm
+
+
+def _fake_playwright_with_page(page: MagicMock) -> MagicMock:
+    pw_cm = MagicMock()
+    pw = MagicMock()
+    pw_cm.__enter__.return_value = pw
+    pw_cm.__exit__.return_value = False
+
+    browser = MagicMock()
+    pw.chromium.launch.return_value = browser
+    context = MagicMock()
+    browser.new_context.return_value = context
+    context.new_page.return_value = page
     return pw_cm
 
 
@@ -119,88 +137,112 @@ def test_check_one_navigates_group_page_then_chat_every_time():
     assert result.preview == "Привет!"
 
 
-def test_list_unread_conversation_titles_activates_switch_when_not_checked():
-    page, clickable = _make_im_page(
-        switch_checked=False,
-        items=[_make_convo_item(title="Кафе «Миндаль»"), _make_convo_item(title="Тренажерный зал «YaGOda»")],
-    )
+def test_walk_unread_dialogs_activates_switch_when_not_checked():
+    page, clickable = _make_im_walk_page(switch_checked=False, dialogs=[])
 
-    adapter = VkInboxAdapter(storage_state={})
-    titles = adapter._list_unread_conversation_titles(page)
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        results: dict[str, ReplyCheckResult] = {}
+        ok = adapter._walk_unread_dialogs({}, results, lambda: None)
 
     clickable.click.assert_called_once()  # тумблер был выключен — обязаны включить
-    assert titles == {"Кафе «Миндаль»", "Тренажерный зал «YaGOda»"}
+    assert ok is True
     page.goto.assert_called_once_with("https://vk.com/im", wait_until="domcontentloaded")
 
 
-def test_list_unread_conversation_titles_does_not_reclick_switch_when_already_checked():
-    page, clickable = _make_im_page(switch_checked=True, items=[_make_convo_item(title="Кафе «Миндаль»")])
+def test_walk_unread_dialogs_does_not_reclick_switch_when_already_checked():
+    page, clickable = _make_im_walk_page(switch_checked=True, dialogs=[])
 
-    adapter = VkInboxAdapter(storage_state={})
-    titles = adapter._list_unread_conversation_titles(page)
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        adapter._walk_unread_dialogs({}, {}, lambda: None)
 
     clickable.click.assert_not_called()  # уже включён — лишний клик выключил бы фильтр
-    assert titles == {"Кафе «Миндаль»"}
 
 
-def test_list_unread_conversation_titles_returns_empty_set_when_list_empty():
-    page, _ = _make_im_page(switch_checked=True, items=[])
-
-    adapter = VkInboxAdapter(storage_state={})
-    assert adapter._list_unread_conversation_titles(page) == set()
-
-
-def test_list_unread_conversation_titles_returns_none_on_navigation_failure():
+def test_walk_unread_dialogs_returns_false_on_navigation_failure():
     page = MagicMock()
     page.goto.side_effect = Exception("navigation failed")
 
-    adapter = VkInboxAdapter(storage_state={})
-    assert adapter._list_unread_conversation_titles(page) is None
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        assert adapter._walk_unread_dialogs({}, {}, lambda: None) is False
 
 
-def test_list_unread_conversation_titles_returns_none_when_switch_never_renders():
+def test_walk_unread_dialogs_returns_false_when_switch_never_renders():
     page = MagicMock()
     page.wait_for_selector.side_effect = PlaywrightTimeoutError("footer did not render")
 
-    adapter = VkInboxAdapter(storage_state={})
-    assert adapter._list_unread_conversation_titles(page) is None
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        assert adapter._walk_unread_dialogs({}, {}, lambda: None) is False
     page.query_selector_all.assert_not_called()  # даже не пытаемся читать список, если он не отрисовался
 
 
-def test_check_replies_skips_leads_not_in_unread_dialog_list_when_filter_enabled(monkeypatch):
+def test_walk_unread_dialogs_matches_by_author_href_not_title(monkeypatch):
+    monkeypatch.setattr(settings, "MIN_DELAY_SEC", 0.0)
+    monkeypatch.setattr(settings, "MAX_DELAY_SEC", 0.0)
+    # Диалог с непрочитанным от лида "lead-1" (external_id="777") + диалог с непрочитанным от
+    # кого-то постороннего, не входящего в pending-лидов этого прогона — второй должен быть
+    # тихо пропущен (не наш лид), а не упасть с ошибкой.
+    dialogs = [
+        ("convo_-777", [_make_message_item("/777", "Здравствуйте, интересует!")]),
+        ("convo_-999", [_make_message_item("/999", "какой-то чужой диалог")]),
+    ]
+    page, _ = _make_im_walk_page(switch_checked=True, dialogs=dialogs)
+
+    leads_by_external_id = {"777": {"id": "lead-1", "external_id": "777"}}
+
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        results: dict[str, ReplyCheckResult] = {}
+        progress_calls: list[int] = []
+        ok = adapter._walk_unread_dialogs(
+            leads_by_external_id, results, lambda: progress_calls.append(1)
+        )
+
+    assert ok is True
+    assert results.keys() == {"lead-1"}
+    assert results["lead-1"].has_reply is True
+    assert results["lead-1"].preview == "Здравствуйте, интересует!"
+    assert len(progress_calls) == 1  # прогресс только для реально совпавшего лида
+
+
+def test_check_replies_uses_unread_walk_results_and_skips_full_scan_when_filter_enabled(monkeypatch):
     monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", True)
-    monkeypatch.setattr(VkInboxAdapter, "_list_unread_conversation_titles", lambda self, page: {"Есть ответ"})
+
+    def fake_walk(self, leads_by_external_id, results, report_progress):
+        results["lead-with-reply"] = ReplyCheckResult(has_reply=True, preview="привет")
+        report_progress()
+        return True
+
+    monkeypatch.setattr(VkInboxAdapter, "_walk_unread_dialogs", fake_walk)
+
+    def fail_check_one(self, page, lead):
+        raise AssertionError("full scan must not run when the unread walk succeeded")
+
+    monkeypatch.setattr(VkInboxAdapter, "_check_one", fail_check_one)
 
     leads = [
-        {"id": "lead-with-reply", "title": "Есть ответ"},
-        {"id": "lead-without-reply", "title": "Без ответа"},
+        {"id": "lead-with-reply", "external_id": "777"},
+        {"id": "lead-without-reply", "external_id": "888"},
     ]
-
-    checked_leads: list[str] = []
-
-    def fake_check_one(self, page, lead):
-        checked_leads.append(lead["id"])
-        return ReplyCheckResult(has_reply=True, preview="привет")
-
-    monkeypatch.setattr(VkInboxAdapter, "_check_one", fake_check_one)
 
     with patch("app.adapters.vk.sync_playwright", side_effect=_fake_playwright_context_manager):
         adapter = VkInboxAdapter(storage_state={})
         progress_calls: list[tuple[int, int]] = []
         results = adapter.check_replies(leads, on_progress=lambda checked, total: progress_calls.append((checked, total)))
 
-    # только лид, чьё название совпало со списком непрочитанных диалогов, реально открывается
-    assert checked_leads == ["lead-with-reply"]
     assert results["lead-with-reply"].has_reply is True
     assert results["lead-without-reply"].has_reply is False
     assert sorted(progress_calls) == [(1, 2), (2, 2)]
 
 
-def test_check_replies_always_checks_leads_without_title_even_when_filter_enabled(monkeypatch):
+def test_check_replies_always_checks_leads_without_external_id_even_when_filter_enabled(monkeypatch):
     monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", True)
-    monkeypatch.setattr(VkInboxAdapter, "_list_unread_conversation_titles", lambda self, page: set())
+    monkeypatch.setattr(VkInboxAdapter, "_walk_unread_dialogs", lambda self, m, r, p: True)
 
-    leads = [{"id": "lead-no-title", "title": None}]
+    leads = [{"id": "lead-no-external-id", "external_id": None}]
     checked_leads: list[str] = []
 
     def fake_check_one(self, page, lead):
@@ -213,17 +255,17 @@ def test_check_replies_always_checks_leads_without_title_even_when_filter_enable
         adapter = VkInboxAdapter(storage_state={})
         adapter.check_replies(leads)
 
-    # без title сопоставить не с чем — не гадаем, что "нет ответа", проверяем напрямую
-    assert checked_leads == ["lead-no-title"]
+    # без external_id сопоставить не с чем — не гадаем, что "нет ответа", проверяем напрямую
+    assert checked_leads == ["lead-no-external-id"]
 
 
 def test_check_replies_runs_full_scan_when_filter_disabled(monkeypatch):
     monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", False)
 
-    def fail_list_unread(self, page):
-        raise AssertionError("dialog list must not be read when filter is disabled")
+    def fail_walk(self, leads_by_external_id, results, report_progress):
+        raise AssertionError("unread dialog list must not be read when filter is disabled")
 
-    monkeypatch.setattr(VkInboxAdapter, "_list_unread_conversation_titles", fail_list_unread)
+    monkeypatch.setattr(VkInboxAdapter, "_walk_unread_dialogs", fail_walk)
 
     checked_leads: list[str] = []
 
@@ -233,7 +275,7 @@ def test_check_replies_runs_full_scan_when_filter_disabled(monkeypatch):
 
     monkeypatch.setattr(VkInboxAdapter, "_check_one", fake_check_one)
 
-    leads = [{"id": f"lead-{i}", "title": f"T{i}"} for i in range(3)]
+    leads = [{"id": f"lead-{i}", "external_id": str(i)} for i in range(3)]
 
     with patch("app.adapters.vk.sync_playwright", side_effect=_fake_playwright_context_manager):
         adapter = VkInboxAdapter(storage_state={})
@@ -245,7 +287,7 @@ def test_check_replies_runs_full_scan_when_filter_disabled(monkeypatch):
 
 def test_check_replies_runs_full_scan_when_unread_dialog_list_undetermined(monkeypatch):
     monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", True)
-    monkeypatch.setattr(VkInboxAdapter, "_list_unread_conversation_titles", lambda self, page: None)
+    monkeypatch.setattr(VkInboxAdapter, "_walk_unread_dialogs", lambda self, m, r, p: False)
 
     checked_leads: list[str] = []
 
@@ -255,7 +297,7 @@ def test_check_replies_runs_full_scan_when_unread_dialog_list_undetermined(monke
 
     monkeypatch.setattr(VkInboxAdapter, "_check_one", fake_check_one)
 
-    leads = [{"id": f"lead-{i}", "title": f"T{i}"} for i in range(3)]
+    leads = [{"id": f"lead-{i}", "external_id": str(i)} for i in range(3)]
 
     with patch("app.adapters.vk.sync_playwright", side_effect=_fake_playwright_context_manager):
         adapter = VkInboxAdapter(storage_state={})
@@ -274,6 +316,7 @@ def test_check_replies_uses_independent_playwright_driver_per_worker(monkeypatch
     monkeypatch.setattr(settings, "INBOX_CHECK_CONCURRENCY", 2)
     monkeypatch.setattr(settings, "MIN_DELAY_SEC", 0.0)
     monkeypatch.setattr(settings, "MAX_DELAY_SEC", 0.0)
+    monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", False)
 
     leads = [{"id": f"lead-{i}"} for i in range(4)]
 

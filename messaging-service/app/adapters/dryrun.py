@@ -17,13 +17,14 @@ class DryRunAdapter:
     def __init__(self, platform: str) -> None:
         self._platform = platform
 
-    def send_message(self, lead: dict, account: dict, text: str) -> SendResult:
+    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
         logger.info(
-            "would send via %s to lead %s (account %s): %s",
+            "would send via %s to lead %s (account %s): %s%s",
             self._platform,
             lead.get("id"),
             account.get("id"),
             text,
+            f" [+ image {image['name']}]" if image else "",
         )
         return SendResult(success=True)
 
