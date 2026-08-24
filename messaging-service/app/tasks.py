@@ -157,10 +157,9 @@ def _process_lead(client: DataServiceClient, task: SendTask, lead: dict, templat
         else:
             client.post_message(_message_payload(lead, account, template, text, "failed", result.error))
             task.failed += 1
-            if result.flood_detected:
-                client.cooldown_account(
-                    account["id"], minutes=_FLOOD_COOLDOWN_MINUTES, reason=result.error or "flood_detected"
-                )
+            if result.flood_detected or result.session_expired:
+                reason = result.error or ("session_expired" if result.session_expired else "flood_detected")
+                client.cooldown_account(account["id"], minutes=_FLOOD_COOLDOWN_MINUTES, reason=reason)
                 cooled_down = True
             else:
                 # Не проблема аккаунта — лид остаётся status=new (можно ретраить в следующем

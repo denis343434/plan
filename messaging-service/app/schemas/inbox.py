@@ -19,4 +19,5 @@ class InboxCheckStatusOut(BaseModel):
     replied: int = 0
     error: str | None = None
     has_more: bool = False
+    session_expired: bool = False
     results: list[InboxCheckResultItem] = []

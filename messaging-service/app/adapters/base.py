@@ -2,11 +2,24 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 
+class SessionExpiredError(Exception):
+    """VK показал экран повторного входа вместо запрошенной страницы (см. _raise_if_login_required
+    в adapters/vk.py) — сохранённая сессия аккаунта протухла, дальнейший обход тем же
+    браузером/аккаунтом бессмысленный. Живёт в base.py (не в vk.py), потому что inbox.py/tasks.py
+    должны ловить её явным except, не подтягивая playwright лениво (см. registry.py — playwright
+    не нужен в fake-режиме)."""
+
+
 @dataclass
 class SendResult:
     success: bool
     error: str | None = None
     flood_detected: bool = False
+    # VK показал экран повторного входа вместо ожидаемой страницы (см. SessionExpiredError в
+    # adapters/vk.py) — проблема аккаунта, не этого лида. Как и flood_detected, сигнализирует
+    # вызывающему коду отправить аккаунт в cooldown вместо повторной попытки на следующем лиде
+    # той же мёртвой сессией.
+    session_expired: bool = False
 
 
 class SendAdapter(Protocol):

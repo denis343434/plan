@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import ElementHandle, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from app.adapters.base import ReplyCheckResult, SendResult
+from app.adapters.base import ReplyCheckResult, SendResult, SessionExpiredError
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,57 @@ _CONVO_ITEM_SELECTOR = ".ConvoList__item"
 # ложный "стабильный" результат, реальные элементы VK досылает асинхронно с задержкой.
 _STABLE_EMPTY_READS_REQUIRED = 15
 
+# Экран VK "Выберите аккаунт для входа" / "Необходимо войти в аккаунт снова" — показывается
+# вместо запрошенной страницы (группы, /im, поиска — куда угодно), когда сохранённый
+# storage_state больше не действителен. Раньше это не распознавалось явно: код просто не
+# находил ожидаемый элемент и после долгого таймаута (или TargetClosedError, если пользователь
+# в недоумении закрывал повисшее headed-окно) переходил к следующему лиду — тот же протухший
+# аккаунт молча перепроверялся по кругу на КАЖДОМ лиде (см. запрос пользователя 2026-08-24,
+# скриншот реального протухшего "рассылкан1"/Павел Языков — 55 лидов подряд с одной и той же
+# ошибкой вместо одной понятной). НЕ проверено вживую под devtools — заведено по скриншоту, а
+# не по разметке; если ловит false positive/negative, свериться через VK_HEADLESS=false и
+# уточнить селектор.
+_LOGIN_REQUIRED_TEXT = "Выберите аккаунт для входа"
+
+
+def _raise_if_login_required(page: Page) -> None:
+    if page.locator(f"text={_LOGIN_REQUIRED_TEXT}").count() > 0:
+        raise SessionExpiredError(
+            "VK требует повторного входа — сохранённая сессия аккаунта протухла, "
+            "нужно перелогиниться (кнопка «Войти в VK» в панели)"
+        )
+
+
+# Блокируем только то, что не влияет на DOM/селекторы, которые этот файл реально читает
+# (кнопка "Написать сообщение", поле ввода, список сообщений/диалогов) — картинки/шрифты/видео
+# и известные сторонние аналитику/трекеры. Специально НЕ трогаем сам JS/CSS VK — это SPA, без
+# его скриптов ничего не отрисуется вообще. Тот же приём и список, что уже проверен вживую в
+# parser-service/app/adapters/vk.py (см. parser-speedup-ideas.md, пункт 1) — здесь дублируем по
+# тому же принципу, что и остальные общие с parser-service константы этого файла.
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+_BLOCKED_URL_SUBSTRINGS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "mc.yandex.ru",
+    "top-fwz1.mail.ru",
+    "top.mail.ru",
+    "an.yandex.ru",
+)
+
+
+def _block_heavy_resources(context) -> None:
+    def handler(route) -> None:
+        request = route.request
+        if request.resource_type in _BLOCKED_RESOURCE_TYPES or any(
+            s in request.url for s in _BLOCKED_URL_SUBSTRINGS
+        ):
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", handler)
+
 
 def _sleep_random() -> None:
     time.sleep(random.uniform(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC))
@@ -121,6 +172,7 @@ class VkSendAdapter:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
+            _block_heavy_resources(context)
             page = context.new_page()
             try:
                 # wait_until="load" (дефолт) у VK почти всегда упирается в таймаут — страница
@@ -131,6 +183,12 @@ class VkSendAdapter:
                 try:
                     send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
+                    # Проверяем ПОСЛЕ таймаута, а не сразу после goto — сразу после goto экран
+                    # повторного входа (если он есть) мог ещё не отрисоваться (та же задержка
+                    # VK, что и у обычного контента), instant-проверка тогда всегда мимо (см.
+                    # запрос пользователя 2026-08-24 — первая версия этой проверки ничего не
+                    # находила). Если это он — SessionExpiredError пробрасывается отсюда же.
+                    _raise_if_login_required(page)
                     # Не проблема аккаунта/кода — либо сообщество отключило приём сообщений
                     # от посторонних (кнопки физически нет), либо VK не успел её отрисовать
                     # за _SLOW_RENDER_TIMEOUT_MS. В обоих случаях это лид-специфичная неудача,
@@ -175,6 +233,11 @@ class VkSendAdapter:
                     return SendResult(success=False, error=flood, flood_detected=True)
 
                 return SendResult(success=True)
+            except SessionExpiredError as exc:
+                # Как и flood_detected — сигнал "проблема в АККАУНТЕ, не в этом лиде": вызывающий
+                # код (tasks.py/reply.py) должен отправить аккаунт в cooldown вместо того, чтобы
+                # снова брать его на следующий лид и упираться в тот же экран входа.
+                return SendResult(success=False, error=str(exc), session_expired=True)
             except Exception as exc:  # unexpected Playwright/DOM failure — reported as a delivery failure
                 logger.exception("vk send failed for lead %s", lead.get("id"))
                 return SendResult(success=False, error=str(exc))
@@ -316,6 +379,12 @@ class VkInboxAdapter:
         for i, lead in enumerate(leads_to_check):
             buckets[i % worker_count].append(lead)
 
+        # Общий на все воркеры сигнал "сессия аккаунта протухла" — один и тот же аккаунт/сессия
+        # у всех воркеров сразу (см. докстринг класса), так что если ЛЮБОЙ из них наткнулся на
+        # экран повторного входа, остальным нет смысла догрызать свои бакеты той же мёртвой
+        # сессией (см. запрос пользователя 2026-08-24 про "бессмысленный поиск").
+        session_expired = threading.Event()
+
         def run_worker(leads_slice: list[dict]) -> None:
             if not leads_slice:
                 return
@@ -328,13 +397,20 @@ class VkInboxAdapter:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
                 context = browser.new_context(storage_state=self._storage_state or None)
+                _block_heavy_resources(context)
                 try:
                     page = context.new_page()
                     for lead in leads_slice:
+                        if session_expired.is_set():
+                            break
                         logger.info(
                             "inbox check: worker %s checking lead %s", thread_name, lead["id"]
                         )
-                        results[lead["id"]] = self._check_one(page, lead)
+                        try:
+                            results[lead["id"]] = self._check_one(page, lead)
+                        except SessionExpiredError:
+                            session_expired.set()
+                            break
                         report_progress()
                         _sleep_random()
                 finally:
@@ -345,6 +421,11 @@ class VkInboxAdapter:
             futures = [executor.submit(run_worker, bucket) for bucket in buckets if bucket]
             for future in futures:
                 future.result()
+        if session_expired.is_set():
+            raise SessionExpiredError(
+                "VK требует повторного входа — сохранённая сессия аккаунта протухла, "
+                "нужно перелогиниться (кнопка «Войти в VK» в панели)"
+            )
         return results
 
     def _walk_unread_dialogs(
@@ -366,13 +447,25 @@ class VkInboxAdapter:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
+            _block_heavy_resources(context)
             try:
                 page = context.new_page()
                 try:
                     page.goto("https://vk.com/im", wait_until="domcontentloaded")
+                except Exception:
+                    return False  # переход не удался (сеть/таймаут) — не гадаем, пойдём в полный обход
+
+                try:
                     page.wait_for_selector(_ONLY_UNREAD_SWITCH_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except Exception:
-                    return False  # страница/список диалогов вообще не отрисовались — не гадаем
+                    # Проверяем ПОСЛЕ таймаута, а не сразу после goto — сразу после goto экран
+                    # повторного входа (если он есть) мог ещё не отрисоваться, instant-проверка
+                    # тогда всегда мимо (см. запрос пользователя 2026-08-24 — первая версия этой
+                    # проверки ничего не находила). Если это он — SessionExpiredError
+                    # пробрасывается отсюда же, наверх (см. check_replies), а не глотается в
+                    # return False: полный обход той же мёртвой сессией настолько же бессмысленный.
+                    _raise_if_login_required(page)
+                    return False  # страница отрисовалась, но список/тумблер — нет: не гадаем
 
                 switch = page.query_selector(_ONLY_UNREAD_SWITCH_SELECTOR)
                 if switch is not None and switch.get_attribute("aria-checked") != "true":
@@ -488,6 +581,9 @@ class VkInboxAdapter:
             try:
                 send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
             except PlaywrightTimeoutError:
+                # Проверяем ПОСЛЕ таймаута, а не сразу после goto — см. тот же приём и
+                # комментарий в VkSendAdapter.send_message.
+                _raise_if_login_required(page)
                 return ReplyCheckResult(
                     has_reply=False,
                     error="кнопка «Написать сообщение» недоступна — переписку не открыть",
@@ -510,6 +606,12 @@ class VkInboxAdapter:
 
             preview = self._last_message_text(items)
             return ReplyCheckResult(has_reply=True, preview=preview)
+        except SessionExpiredError:
+            # В отличие от остальных ошибок этого метода — НЕ проблема конкретного лида, а
+            # всего аккаунта/сессии сразу. Пробрасываем наверх (см. run_worker), а не превращаем
+            # в ReplyCheckResult, иначе вызывающий код тихо продолжит по кругу пробовать
+            # следующих лидов той же мёртвой сессией (см. докстринг SessionExpiredError).
+            raise
         except Exception as exc:  # unexpected Playwright/DOM failure — не роняем весь батч
             logger.exception("reply check failed for lead %s", lead.get("id"))
             return ReplyCheckResult(has_reply=False, error=str(exc))

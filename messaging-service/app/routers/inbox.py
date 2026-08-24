@@ -24,6 +24,7 @@ def _to_out(task: InboxCheckTask) -> InboxCheckStatusOut:
         replied=task.replied,
         error=task.error,
         has_more=task.has_more,
+        session_expired=task.session_expired,
         results=[
             {
                 "message_id": r.message_id,

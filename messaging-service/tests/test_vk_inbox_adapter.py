@@ -2,6 +2,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.adapters.base import ReplyCheckResult
@@ -13,6 +14,7 @@ from app.adapters.vk import (
     _ONLY_UNREAD_SWITCH_CLICKABLE_SELECTOR,
     _ONLY_UNREAD_SWITCH_SELECTOR,
     _SEND_MESSAGE_BUTTON_SELECTOR,
+    SessionExpiredError,
     VkInboxAdapter,
 )
 from app.config import settings
@@ -76,6 +78,7 @@ def _make_im_walk_page(
 
     page.query_selector.side_effect = query_selector
     page.query_selector_all.side_effect = query_selector_all
+    page.locator.return_value.count.return_value = 0  # экрана "войдите заново" нет
     return page, clickable
 
 
@@ -109,6 +112,7 @@ def _fake_playwright_with_page(page: MagicMock) -> MagicMock:
 
 def test_check_one_navigates_group_page_then_chat_every_time():
     page = MagicMock(url="https://vk.com/some_group")
+    page.locator.return_value.count.return_value = 0  # экрана "войдите заново" нет
     lead = {
         "id": "lead-1",
         "group_url": "https://vk.com/some_group",
@@ -135,6 +139,23 @@ def test_check_one_navigates_group_page_then_chat_every_time():
     assert page.goto.call_count == 2
     assert result.has_reply is True
     assert result.preview == "Привет!"
+
+
+def test_check_one_raises_session_expired_when_login_required():
+    # VK показал экран "Выберите аккаунт для входа" вместо страницы группы — сессия протухла.
+    # Раньше это тихо ловилось общим except Exception и превращалось в обычный ReplyCheckResult
+    # с ошибкой (см. запрос пользователя 2026-08-24 — 55 лидов подряд с одной и той же ошибкой
+    # вместо одной понятной остановки). Кнопка "Написать сообщение" в такой ситуации не
+    # отрисуется — проверка стоит именно после этого таймаута, а не сразу после goto
+    # (instant-проверка сразу после goto ничего не находила, экран мог ещё не отрисоваться).
+    page = MagicMock(url="https://vk.com/some_group")
+    page.wait_for_selector.side_effect = PlaywrightTimeoutError("send button did not render")
+    page.locator.return_value.count.return_value = 1
+    lead = {"id": "lead-1", "group_url": "https://vk.com/some_group", "external_id": "777"}
+
+    adapter = VkInboxAdapter(storage_state={})
+    with pytest.raises(SessionExpiredError):
+        adapter._check_one(page, lead)
 
 
 def test_walk_unread_dialogs_activates_switch_when_not_checked():
@@ -171,12 +192,28 @@ def test_walk_unread_dialogs_returns_false_on_navigation_failure():
 
 def test_walk_unread_dialogs_returns_false_when_switch_never_renders():
     page = MagicMock()
+    page.locator.return_value.count.return_value = 0  # экрана "войдите заново" нет
     page.wait_for_selector.side_effect = PlaywrightTimeoutError("footer did not render")
 
     with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
         adapter = VkInboxAdapter(storage_state={})
         assert adapter._walk_unread_dialogs({}, {}, lambda: None) is False
     page.query_selector_all.assert_not_called()  # даже не пытаемся читать список, если он не отрисовался
+
+
+def test_walk_unread_dialogs_raises_session_expired_when_login_required():
+    # Тумблер "Только непрочитанные" не отрисуется, если вместо /im показан экран повторного
+    # входа — проверка на "требуется вход" стоит именно после этого таймаута, а не сразу после
+    # goto (см. запрос пользователя 2026-08-24: instant-проверка сразу после goto ничего не
+    # находила — реальный экран входа мог ещё не отрисоваться).
+    page, _ = _make_im_walk_page(switch_checked=True, dialogs=[])
+    page.wait_for_selector.side_effect = PlaywrightTimeoutError("footer did not render")
+    page.locator.return_value.count.return_value = 1
+
+    with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
+        adapter = VkInboxAdapter(storage_state={})
+        with pytest.raises(SessionExpiredError):
+            adapter._walk_unread_dialogs({}, {}, lambda: None)
 
 
 def test_walk_unread_dialogs_matches_by_author_href_not_title(monkeypatch):
@@ -347,3 +384,32 @@ def test_check_replies_uses_independent_playwright_driver_per_worker(monkeypatch
     assert 1 <= max_active <= 2  # concurrency=2 — параллельно работает не больше двух воркеров
     assert len(set(page_id_by_lead.values())) <= 2  # не больше независимых Page, чем воркеров
     assert sorted(progress_calls) == [(i, 4) for i in range(1, 5)]
+
+
+def test_check_replies_stops_bucket_and_raises_when_session_expired(monkeypatch):
+    # Как только воркер натыкается на экран повторного входа — не долбит им же оставшихся
+    # лидов в своём бакете (см. запрос пользователя 2026-08-24: раньше все 55 лидов подряд
+    # получали одну и ту же ошибку вместо одной понятной остановки).
+    monkeypatch.setattr(settings, "INBOX_CHECK_FILTER_BY_UNREAD_LIST", False)
+    monkeypatch.setattr(settings, "INBOX_CHECK_CONCURRENCY", 1)
+    monkeypatch.setattr(settings, "MIN_DELAY_SEC", 0.0)
+    monkeypatch.setattr(settings, "MAX_DELAY_SEC", 0.0)
+
+    checked_leads: list[str] = []
+
+    def fake_check_one(self, page, lead):
+        checked_leads.append(lead["id"])
+        if lead["id"] == "lead-0":
+            raise SessionExpiredError("сессия протухла")
+        return ReplyCheckResult(has_reply=False)
+
+    monkeypatch.setattr(VkInboxAdapter, "_check_one", fake_check_one)
+
+    leads = [{"id": f"lead-{i}", "external_id": str(i)} for i in range(3)]
+
+    with patch("app.adapters.vk.sync_playwright", side_effect=_fake_playwright_context_manager):
+        adapter = VkInboxAdapter(storage_state={})
+        with pytest.raises(SessionExpiredError):
+            adapter.check_replies(leads)
+
+    assert checked_leads == ["lead-0"]

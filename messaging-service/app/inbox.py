@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from app.adapters.base import SessionExpiredError
 from app.adapters.registry import get_inbox_adapter
 from app.clients.data_service import DataServiceClient
 from app.exceptions import DataServiceError
@@ -54,6 +55,11 @@ class InboxCheckTask:
     # False. Флаг остаётся на случай, если limit когда-нибудь передадут явно (см. историю: с
     # конечным limit десктоп-клиент опирался на has_more, чтобы самому дочищать очередь).
     has_more: bool = False
+    # True, если остановились именно из-за протухшей VK-сессии (см. SessionExpiredError) — не
+    # просто "какая-то ошибка", а конкретно "нужен повторный вход". Десктоп-клиент показывает
+    # это не всплывающим окном (см. запрос пользователя 2026-08-24 — "ошибка должна быть в
+    # приложении, а не окном винды"), а прямо статусом сессии этого аккаунта в таблице.
+    session_expired: bool = False
 
 
 # Ключ — account_id: за один момент времени на аккаунт имеет смысл только одна проверка
@@ -169,6 +175,10 @@ def run_inbox_check_task(account_id: str, limit: int | None = _DEFAULT_CHECK_LIM
     except DataServiceError as exc:
         task.status = InboxCheckStatus.failed
         task.error = str(exc)
+    except SessionExpiredError as exc:
+        task.status = InboxCheckStatus.failed
+        task.error = str(exc)
+        task.session_expired = True
     except Exception as exc:  # noqa: BLE001 - не даём задаче зависнуть на "running" навсегда
         logger.exception("unhandled error in inbox check task %s", account_id)
         task.status = InboxCheckStatus.failed

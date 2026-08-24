@@ -5,7 +5,7 @@ import httpx
 import respx
 from fastapi.testclient import TestClient
 
-from app.adapters.base import ReplyCheckResult
+from app.adapters.base import ReplyCheckResult, SessionExpiredError
 from app.config import settings
 from app.main import app
 
@@ -144,6 +144,41 @@ def test_check_inbox_with_no_pending_messages_short_circuits():
     assert body["checked"] == 0
     assert body["replied"] == 0
     assert body["results"] == []
+
+
+@respx.mock
+def test_check_inbox_reports_session_expired_flag_when_login_required(monkeypatch):
+    # Раньше протухшая сессия превращалась в обычный task.error без структурного признака —
+    # десктоп-клиент не мог отличить её от любой другой ошибки и всегда показывал messagebox
+    # (см. запрос пользователя 2026-08-24 — "ошибка должна быть в приложении, а не окном винды").
+    account_id = str(uuid.uuid4())
+    lead_id = str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/messages").mock(
+        return_value=httpx.Response(200, json=[_message_payload(message_id, lead_id, account_id)])
+    )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[_lead_payload(lead_id)]))
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+
+    class _FakeInboxAdapter:
+        def check_replies(self, leads, on_progress=None):
+            raise SessionExpiredError("VK требует повторного входа")
+
+    monkeypatch.setattr("app.inbox.get_inbox_adapter", lambda platform, storage_state=None: _FakeInboxAdapter())
+
+    with TestClient(app) as client:
+        client.post("/inbox/check", params={"account_id": account_id})
+        status_resp = client.get("/inbox/check-status", params={"account_id": account_id})
+
+    body = status_resp.json()
+    assert body["status"] == "failed"
+    assert body["session_expired"] is True
+    assert "повторного входа" in body["error"]
 
 
 def test_check_status_for_unknown_account_is_404():

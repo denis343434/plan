@@ -32,10 +32,9 @@ def send_reply(lead_id: str, account_id: str, text: str, image: dict | None = No
                 message = client.post_message(
                     _message_payload(lead_id, account_id, text, "failed", result.error)
                 )
-                if result.flood_detected:
-                    client.cooldown_account(
-                        account_id, minutes=_FLOOD_COOLDOWN_MINUTES, reason=result.error or "flood_detected"
-                    )
+                if result.flood_detected or result.session_expired:
+                    reason = result.error or ("session_expired" if result.session_expired else "flood_detected")
+                    client.cooldown_account(account_id, minutes=_FLOOD_COOLDOWN_MINUTES, reason=reason)
                     cooled_down = True
         finally:
             if not cooled_down:
