@@ -8,6 +8,7 @@ from app.adapters.vk import (
     _COMMUNITIES_SECTION_LABEL,
     _SEARCH_INPUT_SELECTOR,
     _SEARCH_RESULTS_LABEL,
+    SessionExpiredError,
     VkParserAdapter,
 )
 from app.config import settings
@@ -59,6 +60,7 @@ def _make_page(
     page.wait_for_function.side_effect = wait_for_function
     page.query_selector_all.return_value = headers
     page.query_selector.return_value = MagicMock() if captcha else None  # капча-селектор
+    page.locator.return_value.count.return_value = 0  # экрана "войдите заново" нет
     return page, search_input
 
 
@@ -115,4 +117,19 @@ def test_open_communities_search_raises_when_search_input_never_renders():
 
     adapter = VkParserAdapter(storage_state={})
     with pytest.raises(RuntimeError):
+        adapter._open_communities_search(page, "keyword", [])
+
+
+def test_open_communities_search_raises_session_expired_when_login_required():
+    # VK показывает экран "Выберите аккаунт для входа" вместо ленты — сохранённая сессия
+    # протухла. Строка поиска в такой ситуации не появится за 30с (реальный экран входа —
+    # не тот же компонент), поэтому проверка на "требуется вход" стоит именно после этого
+    # таймаута, а не сразу после goto (см. запрос пользователя 2026-08-24: instant-проверка
+    # сразу после goto ничего не находила — реальный контент VK иногда рисуется только через
+    # 18-20с, см. комментарий в _open_communities_search).
+    page, _ = _make_page([], search_input_ok=False)
+    page.locator.return_value.count.return_value = 1
+
+    adapter = VkParserAdapter(storage_state={})
+    with pytest.raises(SessionExpiredError):
         adapter._open_communities_search(page, "keyword", [])

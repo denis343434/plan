@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.logging_conf import configure_logging
-from app.routers import parse
+from app.routers import accounts, config, parse
 
 configure_logging()
 
@@ -14,6 +14,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(parse.router)
+app.include_router(config.router)
+app.include_router(accounts.router)
 
 
 @app.get("/health")

@@ -60,6 +60,90 @@ _GROUP_LINK_SELECTOR = "a.vkuiAvatar__host"
 _GROUP_TITLE_SELECTOR = '[class*="vkuiHeadline"]'  # компонент не рендерит "__host", только "__level*"/"__density*"
 _CAPTCHA_SELECTOR = "div.captcha, form[action*='captcha']"
 
+# Таймаут на признак "залогинены" короче, чем _SLOW_RENDER_TIMEOUT_MS в других местах файла —
+# это ручная разовая проверка из панели (см. routers/accounts.py), а не фоновая задача, где
+# лишние 15-20с ожидания незаметны. Если сессия жива, поисковая строка и так обычно
+# отрисовывается за пару секунд; если сессии нет — VK либо сразу редиректит на экран выбора
+# аккаунта, либо просто не рисует авторизованный хедер, ждать дольше нет смысла.
+_SESSION_CHECK_TIMEOUT_MS = 15_000
+
+# Экран VK "Выберите аккаунт для входа" / "Необходимо войти в аккаунт снова" — показывается
+# вместо запрошенной страницы, когда сохранённый storage_state больше не действителен. Раньше
+# явно не распознавался: код просто не находил ожидаемый элемент и после долгого таймаута шёл
+# дальше по кандидатам, каждый раз впустую (см. запрос пользователя 2026-08-24 — то же самое
+# уже чинили для messaging-service/app/adapters/vk.py, здесь дублируем по тому же принципу).
+# НЕ проверено вживую под devtools — заведено по скриншоту, а не по разметке.
+_LOGIN_REQUIRED_TEXT = "Выберите аккаунт для входа"
+
+
+class SessionExpiredError(Exception):
+    """VK показал экран повторного входа вместо запрошенной страницы — сохранённая сессия
+    аккаунта протухла, дальнейший обход тем же браузером/аккаунтом бессмысленный."""
+
+
+def _raise_if_login_required(page: Page) -> None:
+    if page.locator(f"text={_LOGIN_REQUIRED_TEXT}").count() > 0:
+        raise SessionExpiredError(
+            "VK требует повторного входа — сохранённая сессия аккаунта протухла, "
+            "нужно перелогиниться (кнопка «Войти в VK» в панели)"
+        )
+
+
+# Блокируем только то, что не влияет на DOM/селекторы, которые парсер реально читает (карточки
+# поиска, поле сайта группы, строка поиска в шапке) — картинки/шрифты/видео и известные
+# сторонние аналитику/трекеры. Специально НЕ трогаем сам JS/CSS VK — это SPA, без его скриптов
+# ничего не отрисуется вообще, а не просто "будет некрасиво". См. parser-speedup-ideas.md,
+# пункт 1 ("Резать вес страниц") — по этому же документу риск низкий (белый список типов
+# ресурсов и доменов, которые режем, а не чёрный список того, что оставляем), эффект высокий.
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+_BLOCKED_URL_SUBSTRINGS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "mc.yandex.ru",
+    "top-fwz1.mail.ru",
+    "top.mail.ru",
+    "an.yandex.ru",
+)
+
+
+def _block_heavy_resources(context) -> None:
+    def handler(route) -> None:
+        request = route.request
+        if request.resource_type in _BLOCKED_RESOURCE_TYPES or any(
+            s in request.url for s in _BLOCKED_URL_SUBSTRINGS
+        ):
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", handler)
+
+
+def check_session(storage_state: dict | None) -> bool:
+    """Реальная проверка через Playwright: жива ли сохранённая VK-сессия.
+
+    Открывает vk.ru/feed с сохранённым storage_state и ждёт верхнюю строку поиска
+    (_SEARCH_INPUT_SELECTOR — тот же признак "залогинен", что и в _open_communities_search) —
+    она рисуется только в авторизованном интерфейсе VK, при протухшей сессии вместо этого
+    показывается экран выбора аккаунта/повторного входа.
+    """
+    if not storage_state:
+        return False
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
+        context = browser.new_context(storage_state=storage_state)
+        _block_heavy_resources(context)
+        page = context.new_page()
+        try:
+            page.goto(_FEED_URL, wait_until="domcontentloaded")
+            page.wait_for_selector(_SEARCH_INPUT_SELECTOR, timeout=_SESSION_CHECK_TIMEOUT_MS)
+            return True
+        except PlaywrightTimeoutError:
+            return False
+        finally:
+            browser.close()
+
 
 class VkParserAdapter:
     def __init__(self, storage_state: dict) -> None:
@@ -75,6 +159,7 @@ class VkParserAdapter:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
+            _block_heavy_resources(context)
             page = context.new_page()
             try:
                 self._open_communities_search(page, keyword, leads)
@@ -134,6 +219,11 @@ class VkParserAdapter:
             # висит в скелетон-заглушке) — короткий таймаут тут стабильно ловил "не нашли".
             search_input = page.wait_for_selector(_SEARCH_INPUT_SELECTOR, timeout=30_000)
         except PlaywrightTimeoutError:
+            # Проверяем ПОСЛЕ таймаута, а не сразу после goto — сразу после goto экран
+            # повторного входа (если он есть) ещё мог не отрисоваться (та же задержка VK,
+            # что и в комментарии выше), instant-проверка тогда всегда мимо (см. запрос
+            # пользователя 2026-08-24 — первая версия этой проверки ничего не находила).
+            _raise_if_login_required(page)
             raise RuntimeError("VK не догрузился — строка поиска в шапке не появилась за 30с")
         self._raise_if_captcha(page, collected_so_far)
 
@@ -226,6 +316,11 @@ class VkParserAdapter:
             page.goto(group_url, wait_until="domcontentloaded")
             page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
         except PlaywrightTimeoutError:
+            # Проверяем ПОСЛЕ таймаута, а не сразу после goto — см. тот же приём и комментарий
+            # в _open_communities_search. Если это он — SessionExpiredError пробрасывается
+            # наверх отсюда же (не ловится ниже: раз уж КАЖДЫЙ оставшийся кандидат в этом же
+            # цикле получил бы ту же мёртвую сессию, см. запрос пользователя 2026-08-24).
+            _raise_if_login_required(page)
             return False  # поле не появилось за разумное время — у группы просто нет сайта
         except Exception:
             logger.warning("failed to check site presence for %s, treating as no site", group_url, exc_info=True)
