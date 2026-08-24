@@ -147,6 +147,13 @@ class App(tk.Tk):
         # Последний загруженный /accounts по id — используется секундным тиком (см.
         # _tick_account_cooldowns) для отсчёта кулдауна без похода в сеть на каждую секунду.
         self._accounts_cache: dict[str, dict] = {}
+        # account_id -> результат последней РЕАЛЬНОЙ проверки VK-сессии через Playwright
+        # (см. on_check_sessions/GET /accounts/{id}/session-check у parser-service) — в отличие
+        # от has_session (просто "сохраняли ли когда-то storage_state"), это фактическое "жива ли
+        # она сейчас". Живёт только в памяти клиента поверх обычного refresh_accounts (тик каждые
+        # REFRESH_LIST_MS), пока пользователь не перепроверит или не перелогинит аккаунт заново.
+        self._session_check_cache: dict[str, bool] = {}
+        self._session_check_pending = 0
         # Окно "Кому написали" — держим ссылку, чтобы повторный клик по кнопке в шапке
         # поднимал уже открытое окно, а не плодил дубликаты.
         self._messages_win: tk.Toplevel | None = None
@@ -198,6 +205,7 @@ class App(tk.Tk):
         self._build_layout()
         self._schedule_list_refresh()
         self.refresh_health()
+        self.refresh_headless_mode()
         self.refresh_accounts()
         self.refresh_campaigns()
         self._tick_account_cooldowns()
@@ -208,11 +216,20 @@ class App(tk.Tk):
         # молча ничего не делает ни в одном Entry/Text приложения. keycode — это код физической
         # клавиши, он не зависит от раскладки, поэтому дублируем действия через него.
         actions = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+        # keysym для этих же действий на английской раскладке — там штатный Tk-биндинг класса
+        # Entry/Text и так сработает сам. Раньше это не проверялось, и на английской раскладке
+        # вставка срабатывала ДВАЖДЫ — сначала штатный биндинг класса (bindtag выше, чем bind_all
+        # ниже), потом ещё раз наш keycode-биндинг поверх него — текст при вставке дублировался
+        # (подтверждено пользователем 2026-08-24). Вмешиваемся только когда keysym НЕ совпадает
+        # со штатным (т.е. раскладка не английская и штатный биндинг молчит).
+        _standard_keysyms = {"<<Paste>>": "v", "<<Copy>>": "c", "<<Cut>>": "x", "<<SelectAll>>": "a"}
 
         def on_control_key(event: tk.Event) -> str | None:
             action = actions.get(event.keycode)
             if action is None or not (event.state & 0x4):
                 return None
+            if event.keysym.lower() == _standard_keysyms[action]:
+                return None  # штатный Tk-биндинг уже обработает сам — не дублируем
             widget = event.widget
             if not isinstance(widget, (tk.Entry, tk.Text)):
                 return None
@@ -234,6 +251,7 @@ class App(tk.Tk):
         ttk.Label(header, text="VK Lead-Gen — панель управления", font=("Segoe UI", 13, "bold")).pack(side="left")
         ttk.Button(header, text="Остановить приложение", style="Danger.TButton", command=self.on_stop_app).pack(side="right", padx=(12, 0))
         ttk.Button(header, text="Кому написали", command=self.open_messages_window).pack(side="right", padx=(12, 0))
+        self._build_headless_toggle(header).pack(side="right", padx=(12, 0))
         self.health_frame = ttk.Frame(header)
         self.health_frame.pack(side="right")
         self.health_dots: dict[str, ttk.Label] = {}
@@ -255,6 +273,54 @@ class App(tk.Tk):
         self._build_accounts_panel(body).grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
         self._build_campaigns_panel(body).grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
         self._build_detail_panel(body).grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+
+    def _build_headless_toggle(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text="Playwright:", font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self.headless_mode = tk.StringVar(value="headless")
+        ttk.Radiobutton(
+            frame, text="В фоне", value="headless", variable=self.headless_mode, command=self.on_headless_mode_change
+        ).pack(side="left")
+        ttk.Radiobutton(
+            frame, text="На экране", value="headed", variable=self.headless_mode, command=self.on_headless_mode_change
+        ).pack(side="left")
+        return frame
+
+    def refresh_headless_mode(self) -> None:
+        # Источник истины — parser-service (оба сервиса переключаются вместе через
+        # on_headless_mode_change, так что после старта приложения они не должны расходиться;
+        # если всё же разошлись, например, из-за прямого запроса к API мимо панели — покажем
+        # тот режим, что видит parser-service).
+        def fetch():
+            return api_request(PARSER_URL, "/config/headless")
+
+        def done(result: dict | None) -> None:
+            if result is not None:
+                self.headless_mode.set("headed" if result.get("headless") is False else "headless")
+
+        self.run_bg(fetch, on_done=done)
+
+    def on_headless_mode_change(self) -> None:
+        headless = self.headless_mode.get() == "headless"
+        mode_label = "в фоне" if headless else "на экране"
+
+        def push():
+            errors = []
+            for base in (PARSER_URL, MESSAGING_URL):
+                try:
+                    api_request(base, "/config/headless", method="PUT", body={"headless": headless})
+                except ApiError as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise ApiError("; ".join(errors))
+
+        def done(_) -> None:
+            self.flash_status(f"Режим Playwright для новых запусков: {mode_label}")
+
+        def error(exc) -> None:
+            self.flash_status(f"Не удалось применить режим Playwright ({mode_label}): {exc}", is_err=True)
+
+        self.run_bg(push, on_done=done, on_error=error)
 
     def _build_accounts_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         panel = ttk.LabelFrame(parent, text="Аккаунты", padding=10)
@@ -289,12 +355,14 @@ class App(tk.Tk):
             self.acc_tree.column(col, width=width, anchor="w")
         self.acc_tree.tag_configure("no_session", foreground="#c0392b")
         self.acc_tree.tag_configure("has_session", foreground="#2e9e4f")
+        self.acc_tree.tag_configure("checking_session", foreground="#888")
         self.acc_tree.pack(fill="both", expand=True)
 
         acc_actions = ttk.Frame(panel)
         acc_actions.pack(fill="x", pady=(6, 0))
         ttk.Button(acc_actions, text="Тестовая сессия для выбранного", command=self.on_set_session).pack(side="left")
         ttk.Button(acc_actions, text="Войти в VK", command=self.on_vk_login).pack(side="left", padx=(6, 0))
+        ttk.Button(acc_actions, text="Проверить сессии", command=self.on_check_sessions).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Остановить аккаунт", style="Danger.TButton", command=self.on_pause_account).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Продолжить", style="Success.TButton", command=self.on_resume_account).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Удалить аккаунт", style="Danger.TButton", command=self.on_delete_account).pack(side="left", padx=(6, 0))
@@ -369,8 +437,20 @@ class App(tk.Tk):
         self.tpl_body.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self._placeholder(self.tpl_body, "Здравствуйте, {{org_name}}!")
         ttk.Button(tpl_form, text="Сохранить шаблон", command=self.on_save_template).pack(side="left")
-        self.tpl_list_label = ttk.Label(panel, text="", foreground="#777", wraplength=1100, justify="left")
-        self.tpl_list_label.pack(fill="x", pady=(0, 10))
+        ttk.Button(tpl_form, text="Удалить шаблон", style="Danger.TButton", command=self.on_delete_template).pack(
+            side="left", padx=(6, 0)
+        )
+
+        tpl_cols = ("variant", "body")
+        self.tpl_tree = ttk.Treeview(panel, columns=tpl_cols, show="headings", height=3)
+        for col, title, width in (("variant", "Вариант", 70), ("body", "Текст", 900)):
+            self.tpl_tree.heading(col, text=title)
+            self.tpl_tree.column(col, width=width, anchor="w")
+        self.tpl_tree.pack(fill="x", pady=(0, 10))
+        # Клик по строке подставляет её вариант/текст в форму выше — удобно и для правки перед
+        # "Сохранить шаблон" (тот же вариант обновит именно эту запись, см. on_save_template в
+        # data-service — upsert по campaign_id+variant), и чтобы точно понимать, что удалишь.
+        self.tpl_tree.bind("<<TreeviewSelect>>", self._on_template_row_selected)
 
         ttk.Label(panel, text="ЛИДЫ КАМПАНИИ", font=("Segoe UI", 9, "bold"), foreground="#777").pack(anchor="w")
         cols = ("title", "group_url", "status")
@@ -486,7 +566,17 @@ class App(tk.Tk):
             for a in accounts:
                 usage = f"{a['hourly_used']}/{a['hourly_limit']} ч · {a['daily_used']}/{a['daily_limit']} сут"
                 has_session = a.get("has_session", False)
-                session_text = "есть" if has_session else "нет входа"
+                # Реальный результат "Проверить сессии" (см. on_check_sessions) перекрывает
+                # дефолтный "есть/нет входа" по has_session — тот отвечает только "сохраняли ли
+                # когда-то storage_state", а не жива ли сессия сейчас (см. _session_check_cache).
+                checked = self._session_check_cache.get(a["id"]) if has_session else None
+                if checked is True:
+                    session_text, session_tag = "жива", "has_session"
+                elif checked is False:
+                    session_text, session_tag = "истекла", "no_session"
+                else:
+                    session_text = "есть" if has_session else "нет входа"
+                    session_tag = "has_session" if has_session else "no_session"
                 self.acc_tree.insert(
                     "", "end", iid=a["id"],
                     values=(
@@ -494,7 +584,7 @@ class App(tk.Tk):
                         RU_ACCOUNT_STATUS.get(a["status"], a["status"]), session_text, usage,
                         self._cooldown_text(a),
                     ),
-                    tags=("has_session" if has_session else "no_session",),
+                    tags=(session_tag,),
                 )
 
         def error(exc):
@@ -654,6 +744,56 @@ class App(tk.Tk):
             self.flash_status("Окно логина VK открывается в отдельной консоли…")
         except OSError as exc:
             messagebox.showerror("Вход в VK", f"Не удалось запустить скрипт логина: {exc}")
+
+    def _set_session_cell(self, account_id: str, text: str, tag: str) -> None:
+        if not self.acc_tree.exists(account_id):
+            return
+        values = list(self.acc_tree.item(account_id, "values"))
+        values[3] = text  # колонка "session" — см. cols в _build_accounts_panel
+        self.acc_tree.item(account_id, values=values, tags=(tag,))
+
+    def on_check_sessions(self) -> None:
+        # Проверяем реально, только если хоть какая-то сессия сохранена (has_session) — без
+        # неё и так очевидно "нет входа", ходить в parser-service незачем (см. GET
+        # /accounts/{id}/session-check). При VK_HEADLESS=false на каждый аккаунт открывается
+        # своё окно Chromium — это ожидаемо и есть весь смысл кнопки.
+        targets = [a for a in self._accounts_cache.values() if a.get("has_session")]
+        if not targets:
+            self.flash_status("Ни у одного аккаунта нет сохранённой сессии — нечего проверять")
+            return
+        if self._session_check_pending:
+            self.flash_status("Проверка сессий уже идёт…", is_err=True)
+            return
+
+        self._session_check_pending = len(targets)
+        for a in targets:
+            self._set_session_cell(a["id"], "проверяю…", "checking_session")
+        self.flash_status(f"Проверяю сессии ({len(targets)})… может открыться окно Chromium на аккаунт")
+
+        for a in targets:
+            account_id = a["id"]
+
+            def fetch(account_id=account_id):
+                return api_request(PARSER_URL, f"/accounts/{account_id}/session-check", timeout=25.0)
+
+            def done(result, account_id=account_id):
+                valid = bool(result and result.get("valid"))
+                self._session_check_cache[account_id] = valid
+                self._set_session_cell(
+                    account_id, "жива" if valid else "истекла", "has_session" if valid else "no_session"
+                )
+                self._session_check_pending -= 1
+                if self._session_check_pending <= 0:
+                    self.flash_status("Проверка сессий завершена")
+
+            def error(exc, account_id=account_id):
+                self._session_check_cache.pop(account_id, None)
+                self._set_session_cell(account_id, "ошибка проверки", "no_session")
+                self._session_check_pending -= 1
+                if self._session_check_pending <= 0:
+                    self.flash_status(f"Проверка сессий завершена с ошибками: {exc}", is_err=True)
+
+            self.run_bg(fetch, on_done=done, on_error=error)
 
     # ---------- campaigns ----------
     def refresh_campaigns(self) -> None:
@@ -974,11 +1114,22 @@ class App(tk.Tk):
         def done(templates):
             if campaign_id != self.selected_campaign_id:
                 return
+            self.tpl_tree.delete(*self.tpl_tree.get_children())
             own = [t for t in templates if t.get("campaign_id") == campaign_id]
-            text = "сохранено: " + " · ".join(f'{t["variant"]} — "{t["body"]}"' for t in own) if own else "шаблонов пока нет"
-            self.tpl_list_label.configure(text=text)
+            for t in sorted(own, key=lambda t: t["variant"]):
+                self.tpl_tree.insert("", "end", iid=t["id"], values=(t["variant"], t["body"]))
 
         self.run_bg(fetch, on_done=done, dedupe_key="templates")
+
+    def _on_template_row_selected(self, _event: object = None) -> None:
+        selected = self.tpl_tree.selection()
+        if not selected:
+            return
+        variant, body = self.tpl_tree.item(selected[0], "values")
+        self.tpl_variant.set(variant)
+        self.tpl_body.delete(0, "end")
+        self.tpl_body.insert(0, body)
+        self.tpl_body.configure(foreground="black")
 
     def on_save_template(self) -> None:
         if not self.selected_campaign_id:
@@ -991,6 +1142,9 @@ class App(tk.Tk):
             return
 
         def save():
+            # data-service делает upsert по (campaign_id, variant) — повторное сохранение того
+            # же варианта обновляет существующую запись, а не плодит дубликат (см. crud/
+            # templates.py::create_template).
             return api_request(DATA_URL, "/templates", method="POST", body=payload)
 
         def done(_result):
@@ -1001,6 +1155,28 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", str(exc))
 
         self.run_bg(save, on_done=done, on_error=error)
+
+    def on_delete_template(self) -> None:
+        selected = self.tpl_tree.selection()
+        if not selected:
+            messagebox.showinfo("Шаблон", "Сначала выберите шаблон в таблице")
+            return
+        template_id = selected[0]
+        variant, body = self.tpl_tree.item(template_id, "values")
+        if not messagebox.askyesno("Удалить шаблон", f'Удалить вариант {variant} — "{body}"?'):
+            return
+
+        def delete():
+            return api_request(DATA_URL, f"/templates/{template_id}", method="DELETE")
+
+        def done(_result):
+            self.flash_status("Шаблон удалён")
+            self.refresh_templates()
+
+        def error(exc):
+            messagebox.showerror("Ошибка", str(exc))
+
+        self.run_bg(delete, on_done=done, on_error=error)
 
     # ---------- messages ("Кому написали") ----------
     def open_messages_window(self) -> None:
@@ -1417,8 +1593,20 @@ class App(tk.Tk):
 
             if status == "failed":
                 self._inbox_check_account_id = None
-                self.inbox_check_status.configure(text="")
-                messagebox.showerror("Входящие", result.get("error") or "не удалось проверить входящие")
+                if result.get("session_expired"):
+                    # Не всплывающее окно — это известная, часто повторяющаяся ситуация
+                    # (сессия аккаунта протухла), а не неожиданный сбой. Показываем прямо в
+                    # приложении: статус сессии этого аккаунта в таблице аккаунтов (см.
+                    # _session_check_cache/on_check_sessions) + текст в строке проверки —
+                    # см. запрос пользователя 2026-08-24 "ошибка должна быть в приложении, а
+                    # не окном винды".
+                    self._session_check_cache[account_id] = False
+                    self._set_session_cell(account_id, "истекла", "no_session")
+                    self.inbox_check_status.configure(text="сессия VK истекла — см. колонку «Вход в VK» в таблице аккаунтов")
+                    self.flash_status(f"Входящие: {result.get('error') or 'сессия VK истекла'}", is_err=True)
+                else:
+                    self.inbox_check_status.configure(text="")
+                    messagebox.showerror("Входящие", result.get("error") or "не удалось проверить входящие")
                 return
 
             totals["checked"] += result["checked"]
