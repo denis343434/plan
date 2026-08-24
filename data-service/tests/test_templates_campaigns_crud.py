@@ -27,3 +27,40 @@ def test_campaign_template_crud_flow(client: TestClient) -> None:
 
     templates = client.get("/templates").json()
     assert any(t["id"] == template["id"] for t in templates)
+
+
+def test_saving_same_variant_twice_updates_instead_of_duplicating(client: TestClient) -> None:
+    campaign = client.post(
+        "/campaigns", json={"name": "Cafe", "platform": "vk", "keyword": "cafe"}
+    ).json()
+
+    first = client.post(
+        "/templates", json={"campaign_id": campaign["id"], "variant": "A", "body": "Здравствуйте!"}
+    ).json()
+    second = client.post(
+        "/templates", json={"campaign_id": campaign["id"], "variant": "A", "body": "Добрый день!"}
+    ).json()
+
+    # Тот же id, обновлённый текст — не вторая строка (см. запрос пользователя 2026-08-24:
+    # каждый клик "Сохранить шаблон" по одному и тому же варианту плодил дубликаты).
+    assert second["id"] == first["id"]
+    assert second["body"] == "Добрый день!"
+
+    own = [t for t in client.get("/templates").json() if t["campaign_id"] == campaign["id"]]
+    assert len(own) == 1
+
+
+def test_delete_template_removes_it(client: TestClient) -> None:
+    campaign = client.post(
+        "/campaigns", json={"name": "Gym", "platform": "vk", "keyword": "gym"}
+    ).json()
+    template = client.post(
+        "/templates", json={"campaign_id": campaign["id"], "variant": "A", "body": "Hi!"}
+    ).json()
+
+    delete_resp = client.delete(f"/templates/{template['id']}")
+    assert delete_resp.status_code == 204
+
+    assert client.get(f"/templates/{template['id']}").status_code == 404
+    own = [t for t in client.get("/templates").json() if t["campaign_id"] == campaign["id"]]
+    assert own == []

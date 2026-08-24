@@ -30,3 +30,8 @@ def update_template(
     template_id: UUID, update: TemplateUpdate, db: Session = Depends(get_db)
 ) -> TemplateOut:
     return crud.update_template(db, template_id, update)
+
+
+@router.delete("/{template_id}", status_code=204)
+def delete_template(template_id: UUID, db: Session = Depends(get_db)) -> None:
+    crud.delete_template(db, template_id)
