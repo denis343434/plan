@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # и не пропущен).
     INBOX_CHECK_FILTER_BY_UNREAD_LIST: bool = True
 
+    # Сколько ждать поле "официальный сайт сообщества" на уже загруженной странице группы перед
+    # отправкой — см. VkSendAdapter._has_external_site. То же значение, что и VK_SITE_CHECK_TIMEOUT_MS
+    # в parser-service/app/config.py (тот же селектор, тот же смысл: не нашли за это время — сайта нет).
+    VK_SITE_CHECK_TIMEOUT_MS: int = 4000
+
     LOG_LEVEL: str = "INFO"
 
 

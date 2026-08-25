@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,14 @@ _SLOW_RENDER_TIMEOUT_MS = 40_000
 # кнопки "Написать сообщение" (data-testid="group_action_send_message") — в нём уже
 # зашит настоящий числовой ID (/im/convo/-<id>...), резолвить screen_name самим не нужно.
 _SEND_MESSAGE_BUTTON_SELECTOR = '[data-testid="group_action_send_message"]'
+
+# Поле "официальный сайт сообщества" в шапке группы — тот же селектор и тот же принцип валидации
+# (доменоподобная строка, не просто "поле непустое"), что и в parser-service/app/adapters/vk.py::
+# _has_external_site. Парсер уже фильтрует сообщества с сайтом на этапе поиска, но иногда
+# пропускает такую группу (см. запрос пользователя 2026-08-25) — эта проверка перед отправкой
+# ловит такие случаи здесь же, вместо того чтобы молча писать в сообщество с собственным сайтом.
+_SITE_FIELD_SELECTOR = '[data-testid="group-info-site"]'
+_SITE_DOMAIN_PATTERN = re.compile(r"[a-zа-яё0-9][a-zа-яё0-9-]*\.[a-zа-яё]{2,}", re.IGNORECASE)
 
 # Селекторы проверены вживую 2026-08-20 через реальный залогиненный аккаунт (см. также
 # parser-service/app/adapters/vk.py — тот же VKUI, тот же принцип подбора).
@@ -196,6 +205,14 @@ class VkSendAdapter:
                 # вовсе, хотя сам контент уже отрисован. "domcontentloaded" + явные ожидания
                 # конкретных элементов — надёжнее.
                 _goto_or_raise(page, lead["group_url"])
+
+                if self._has_external_site(page) is True:
+                    return SendResult(
+                        success=False,
+                        error="у сообщества указан собственный сайт — рассылка пропущена (похоже, ошибка парсера)",
+                        has_site=True,
+                    )
+
                 try:
                     send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
@@ -263,6 +280,28 @@ class VkSendAdapter:
             finally:
                 context.close()
                 browser.close()
+
+    def _has_external_site(self, page: Page) -> bool | None:
+        """Страница группы уже загружена (см. вызов сразу после _goto_or_raise в send_message) —
+        здесь только проверяем поле сайта на ней, второй goto не нужен (в отличие от
+        parser-service::_has_external_site, которому ещё только предстоит перейти на страницу
+        кандидата). True/False — однозначный результат, None — не удалось определить (страница
+        отрисовалась не полностью по неожиданной причине); вызывающий код в этом случае не
+        блокирует отправку — see send_message."""
+        try:
+            page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            # Проверяем ПОСЛЕ таймаута, а не сразу — тот же приём, что и у остальных проверок в
+            # этом файле (экран повторного входа сам ещё мог не отрисоваться сразу после goto).
+            _raise_if_login_required(page)
+            return False  # страница загрузилась, поля просто нет — сайта нет
+        except Exception:
+            logger.warning("failed to check site presence for %s, proceeding with send", page.url, exc_info=True)
+            return None
+        el = page.query_selector(_SITE_FIELD_SELECTOR)
+        if el is None:
+            return False
+        return bool(_SITE_DOMAIN_PATTERN.search(el.inner_text() or ""))
 
     def _detect_flood(self, page: Page) -> str | None:
         if page.query_selector(_CAPTCHA_SELECTOR) is not None:
