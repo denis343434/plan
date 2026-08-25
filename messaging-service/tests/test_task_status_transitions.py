@@ -243,6 +243,85 @@ def test_send_task_records_failed_delivery_and_cooldowns_on_flood():
 
 
 @respx.mock
+def test_send_task_records_pending_delivery_on_network_error_and_does_not_cooldown():
+    # network_error (плохой интернет/страница не прогрузилась) не проблема аккаунта — не должен
+    # уходить в cooldown, как flood/session_expired, и должен писаться как delivery_status=
+    # "pending", а не "failed", иначе лид молча выпал бы из авто-повтора обычным следующим
+    # запуском кампании (см. previously_failed_lead_ids в run_send_task и запрос пользователя).
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    lead1 = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/leads").mock(
+        side_effect=[httpx.Response(200, json=[_lead_payload(lead1)]), httpx.Response(200, json=[])]
+    )
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    post_message_route = respx.post(f"{BASE}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": str(uuid.uuid4()),
+                "lead_id": lead1,
+                "account_id": account_id,
+                "template_variant": "A",
+                "text_sent": "Hi Fitness Club",
+                "sent_at": "2026-01-01T00:00:00",
+                "delivery_status": "pending",
+                "reply_status": "none",
+            },
+        )
+    )
+    cooldown_route = respx.post(f"{BASE}/accounts/{account_id}/cooldown").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="cooldown"))
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    import app.tasks as tasks_module
+    from app.adapters.base import SendResult
+
+    class _NetworkErrorAdapter:
+        def send_message(self, lead, account, text):
+            return SendResult(success=False, error="net::ERR_CONNECTION_RESET", network_error=True)
+
+    original_get_adapter = tasks_module.get_adapter
+    tasks_module.get_adapter = lambda platform, storage_state=None: _NetworkErrorAdapter()
+    try:
+        task = create_task(uuid.UUID(campaign_id))
+        run_send_task(uuid.UUID(campaign_id))
+    finally:
+        tasks_module.get_adapter = original_get_adapter
+
+    assert task.status == SendTaskStatus.done
+    assert task.failed == 1
+    assert task.sent == 0
+    assert not cooldown_route.called
+    assert release_route.called
+    import json
+
+    posted_body = json.loads(post_message_route.calls.last.request.content)
+    assert posted_body["delivery_status"] == "pending"
+
+
+@respx.mock
 def test_send_task_skips_leads_with_prior_failed_message_by_default():
     """Лид, у которого уже есть сообщение с delivery_status=failed (провал в предыдущем запуске
     кампании), не должен подхватываться обычным запуском — иначе бот писал бы ему заново на

@@ -120,6 +120,74 @@ def test_open_communities_search_raises_when_search_input_never_renders():
         adapter._open_communities_search(page, "keyword", [])
 
 
+def _make_site_check_page(goto_side_effect=None, site_timeout=False, site_field_text=None, wait_for_selector_exc=None):
+    page = MagicMock()
+    if goto_side_effect is not None:
+        page.goto.side_effect = goto_side_effect
+    page.locator.return_value.count.return_value = 0  # экрана "войдите заново" нет
+
+    if wait_for_selector_exc is not None:
+        page.wait_for_selector.side_effect = wait_for_selector_exc
+    elif site_timeout:
+        page.wait_for_selector.side_effect = PlaywrightTimeoutError("site field never appeared")
+    else:
+        page.wait_for_selector.return_value = MagicMock()
+
+    if site_field_text is not None:
+        el = MagicMock()
+        el.inner_text.return_value = site_field_text
+        page.query_selector.return_value = el
+    else:
+        page.query_selector.return_value = None
+    return page
+
+
+def test_has_external_site_true_when_site_field_has_domain():
+    page = _make_site_check_page(site_field_text="example.com")
+
+    adapter = VkParserAdapter(storage_state={})
+    assert adapter._has_external_site(page, "https://vk.com/group") is True
+
+
+def test_has_external_site_false_when_field_never_appears():
+    # Страница загрузилась (goto прошёл), просто нет поля "сайт" — это настоящее "сайта нет".
+    page = _make_site_check_page(site_timeout=True)
+
+    adapter = VkParserAdapter(storage_state={})
+    assert adapter._has_external_site(page, "https://vk.com/group") is False
+
+
+def test_has_external_site_none_when_page_never_loads(monkeypatch):
+    # Плохой интернет/сбой самого goto (не таймаут поля "сайт") — раньше попадал в ту же ветку,
+    # что и "поля нет", и группа с реальным сайтом молча помечалась как без сайта (запрос
+    # пользователя). None здесь означает "не удалось проверить", а не "сайта нет".
+    monkeypatch.setattr("app.adapters.vk.time.sleep", lambda *_: None)
+    page = _make_site_check_page(goto_side_effect=PlaywrightTimeoutError("goto timed out"))
+
+    adapter = VkParserAdapter(storage_state={})
+    assert adapter._has_external_site(page, "https://vk.com/group") is None
+    assert page.goto.call_count == 2  # один ретрай перед тем, как сдаться
+
+
+def test_has_external_site_retries_goto_and_succeeds_on_second_attempt(monkeypatch):
+    monkeypatch.setattr("app.adapters.vk.time.sleep", lambda *_: None)
+    page = _make_site_check_page(
+        goto_side_effect=[Exception("network blip"), None],
+        site_field_text="example.com",
+    )
+
+    adapter = VkParserAdapter(storage_state={})
+    assert adapter._has_external_site(page, "https://vk.com/group") is True
+    assert page.goto.call_count == 2
+
+
+def test_has_external_site_none_when_site_field_check_fails_unexpectedly():
+    page = _make_site_check_page(wait_for_selector_exc=RuntimeError("boom"))
+
+    adapter = VkParserAdapter(storage_state={})
+    assert adapter._has_external_site(page, "https://vk.com/group") is None
+
+
 def test_open_communities_search_raises_session_expired_when_login_required():
     # VK показывает экран "Выберите аккаунт для входа" вместо ленты — сохранённая сессия
     # протухла. Строка поиска в такой ситуации не появится за 30с (реальный экран входа —

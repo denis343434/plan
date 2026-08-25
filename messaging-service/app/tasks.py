@@ -155,7 +155,14 @@ def _process_lead(client: DataServiceClient, task: SendTask, lead: dict, templat
             client.post_message(_message_payload(lead, account, template, text, "sent"))
             task.sent += 1
         else:
-            client.post_message(_message_payload(lead, account, template, text, "failed", result.error))
+            # network_error — страница не загрузилась (плохой интернет), не проблема лида: пишем
+            # "pending", а не "failed" — previously_failed_lead_ids выше фильтрует только по
+            # delivery_status=="failed", так что "pending"-лид (status=new в Data Service)
+            # подхватится обычным следующим запуском кампании сам, без ручного "Повторить с
+            # ошибками" (тот же принцип, что и в parser-service для _has_external_site, см.
+            # запрос пользователя).
+            delivery_status = "pending" if result.network_error else "failed"
+            client.post_message(_message_payload(lead, account, template, text, delivery_status, result.error))
             task.failed += 1
             if result.flood_detected or result.session_expired:
                 reason = result.error or ("session_expired" if result.session_expired else "flood_detected")

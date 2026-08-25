@@ -164,6 +164,22 @@ def _sleep_random() -> None:
     time.sleep(random.uniform(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC))
 
 
+class _PageLoadError(Exception):
+    """page.goto сам не смог загрузить страницу (таймаут/сеть/страница закрылась) — это сбой
+    транспорта, а не признак того, что ЭТОМУ лиду нельзя написать. Отличаем от остальных
+    PlaywrightTimeoutError в send_message (там таймаут — на конкретный элемент УЖЕ загруженной
+    страницы, то есть настоящий признак "кнопки нет"/"поле не появилось"). См. тот же принцип в
+    parser-service/app/adapters/vk.py::_has_external_site (запрос пользователя про плохой
+    интернет, ошибочно помечавший группы с реальным сайтом как без сайта)."""
+
+
+def _goto_or_raise(page: Page, url: str) -> None:
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+    except Exception as exc:
+        raise _PageLoadError(str(exc)) from exc
+
+
 class VkSendAdapter:
     def __init__(self, storage_state: dict) -> None:
         self._storage_state = storage_state
@@ -179,7 +195,7 @@ class VkSendAdapter:
                 # держит вебсокет для реалтайм-чата, из-за которого "load" может не наступить
                 # вовсе, хотя сам контент уже отрисован. "domcontentloaded" + явные ожидания
                 # конкретных элементов — надёжнее.
-                page.goto(lead["group_url"], wait_until="domcontentloaded")
+                _goto_or_raise(page, lead["group_url"])
                 try:
                     send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
@@ -198,7 +214,7 @@ class VkSendAdapter:
                         error="у сообщества недоступна кнопка «Написать сообщение» — либо приём сообщений отключён, либо страница не успела прогрузиться",
                     )
                 chat_href = send_btn.get_attribute("href")
-                page.goto(urljoin(page.url, chat_href), wait_until="domcontentloaded")
+                _goto_or_raise(page, urljoin(page.url, chat_href))
                 _sleep_random()
 
                 flood = self._detect_flood(page)
@@ -233,6 +249,9 @@ class VkSendAdapter:
                     return SendResult(success=False, error=flood, flood_detected=True)
 
                 return SendResult(success=True)
+            except _PageLoadError as exc:
+                logger.warning("failed to load VK page for lead %s, will retry: %s", lead.get("id"), exc)
+                return SendResult(success=False, error=str(exc), network_error=True)
             except SessionExpiredError as exc:
                 # Как и flood_detected — сигнал "проблема в АККАУНТЕ, не в этом лиде": вызывающий
                 # код (tasks.py/reply.py) должен отправить аккаунт в cooldown вместо того, чтобы

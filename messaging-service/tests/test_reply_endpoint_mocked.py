@@ -97,6 +97,70 @@ def test_reply_sends_via_same_account_and_persists_message():
 
 
 @respx.mock
+def test_reply_records_pending_delivery_on_network_error():
+    # Плохой интернет при ручном ответе на лид не должен попадать в тот же "ошибка", что и
+    # настоящий сбой отправки — иначе ответ молча теряется в "Ошибки" вместо "Повторно"
+    # (см. запрос пользователя, тот же принцип что и в tasks.py::_process_lead).
+    lead_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/leads/{lead_id}").mock(return_value=httpx.Response(200, json=_lead_payload(lead_id)))
+    respx.post(f"{BASE}/accounts/{account_id}/lock").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+    message_route = respx.post(f"{BASE}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": str(uuid.uuid4()),
+                "lead_id": lead_id,
+                "account_id": account_id,
+                "template_variant": None,
+                "text_sent": "Спасибо, уточню детали",
+                "sent_at": "2026-01-01T00:00:00",
+                "delivery_status": "pending",
+                "reply_status": "none",
+                "error_reason": "net::ERR_CONNECTION_RESET",
+                "reply_preview": None,
+                "replied_at": None,
+            },
+        )
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    import app.reply as reply_module
+    from app.adapters.base import SendResult
+
+    class _NetworkErrorAdapter:
+        def send_message(self, lead, account, text, image=None):
+            return SendResult(success=False, error="net::ERR_CONNECTION_RESET", network_error=True)
+
+    original_get_adapter = reply_module.get_adapter
+    reply_module.get_adapter = lambda platform, storage_state=None: _NetworkErrorAdapter()
+    try:
+        with TestClient(app) as client:
+            resp = client.post(f"/leads/{lead_id}/reply", json={"account_id": account_id, "text": "Спасибо, уточню детали"})
+    finally:
+        reply_module.get_adapter = original_get_adapter
+
+    assert resp.status_code == 200
+    assert resp.json()["delivery_status"] == "pending"
+    assert message_route.called
+    import json
+
+    posted_body = json.loads(message_route.calls.last.request.content)
+    assert posted_body["delivery_status"] == "pending"
+    assert release_route.called
+
+
+@respx.mock
 def test_reply_for_unknown_lead_is_404():
     lead_id = str(uuid.uuid4())
     account_id = str(uuid.uuid4())

@@ -29,8 +29,12 @@ def send_reply(lead_id: str, account_id: str, text: str, image: dict | None = No
             if result.success:
                 message = client.post_message(_message_payload(lead_id, account_id, text, "sent"))
             else:
+                # network_error — страница не загрузилась (плохой интернет), не проблема этого
+                # ответа: "pending" вместо "failed", чтобы не путать с реальным сбоем отправки
+                # (см. тот же принцип в tasks.py::_process_lead и запрос пользователя про парсер).
+                delivery_status = "pending" if result.network_error else "failed"
                 message = client.post_message(
-                    _message_payload(lead_id, account_id, text, "failed", result.error)
+                    _message_payload(lead_id, account_id, text, delivery_status, result.error)
                 )
                 if result.flood_detected or result.session_expired:
                     reason = result.error or ("session_expired" if result.session_expired else "flood_detected")

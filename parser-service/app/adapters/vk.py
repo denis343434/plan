@@ -308,12 +308,30 @@ class VkParserAdapter:
             total_loaded = current_total
             new_count = count_new()
 
-    def _has_external_site(self, page: Page, group_url: str) -> bool:
+    def _has_external_site(self, page: Page, group_url: str) -> bool | None:
         # Лишний реальный переход на страницу каждого кандидата — дороже по времени и риску
         # антибана, чем просто разбор карточек поиска, но иначе сайт не проверить: в самой
         # выдаче поиска домен нигде не показывается.
+        #
+        # goto вынесен в отдельный try с одним ретраем и своим except — раньше его сбой (таймаут
+        # ИЛИ сетевая ошибка/закрытие страницы) попадал в ту же ветку, что и "поле сайта не
+        # появилось на загруженной странице", и группа с реальным сайтом при плохом интернете
+        # молча помечалась как "сайта нет" (см. запрос пользователя). Возвращаем None ("не
+        # удалось проверить"), а не False — вызывающий код в search_communities и так пропускает
+        # кандидата при None (has_site == want_site never true для None), группа просто не попадёт
+        # в этот прогон и будет заново кандидатом в следующем (не в known_external_ids).
+        for attempt in range(2):
+            try:
+                page.goto(group_url, wait_until="domcontentloaded")
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                logger.warning("failed to load group page %s, skipping (unknown site status)", group_url, exc_info=True)
+                return None
+
         try:
-            page.goto(group_url, wait_until="domcontentloaded")
             page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             # Проверяем ПОСЛЕ таймаута, а не сразу после goto — см. тот же приём и комментарий
@@ -321,10 +339,10 @@ class VkParserAdapter:
             # наверх отсюда же (не ловится ниже: раз уж КАЖДЫЙ оставшийся кандидат в этом же
             # цикле получил бы ту же мёртвую сессию, см. запрос пользователя 2026-08-24).
             _raise_if_login_required(page)
-            return False  # поле не появилось за разумное время — у группы просто нет сайта
+            return False  # страница уже загрузилась (goto прошёл) — поля просто нет, сайта нет
         except Exception:
-            logger.warning("failed to check site presence for %s, treating as no site", group_url, exc_info=True)
-            return False
+            logger.warning("failed to check site presence for %s, skipping (unknown site status)", group_url, exc_info=True)
+            return None
         el = page.query_selector(_SITE_FIELD_SELECTOR)
         if el is None:
             return False

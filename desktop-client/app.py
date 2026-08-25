@@ -88,7 +88,7 @@ RU_STATS_LABEL = {
     "replied": "ответили",
     "rejected": "отклонены",
 }
-RU_DELIVERY_STATUS = {"sent": "отправлено", "failed": "ошибка", "pending": "в очереди"}
+RU_DELIVERY_STATUS = {"sent": "отправлено", "failed": "ошибка", "pending": "сбой сети, повтор"}
 RU_REPLY_STATUS = {"none": "-", "replied": "есть ответ", "no_reply": "нет ответа"}
 RU_PURPOSE_REVERSE = {v: k for k, v in RU_PURPOSE.items()}
 PLATFORM_LABELS = {"vk": "VK", "telegram": "Telegram", "instagram": "Instagram"}
@@ -162,9 +162,11 @@ class App(tk.Tk):
         self._reply_compose_text: tk.Text | None = None
         self.reply_send_button: ttk.Button | None = None
         self._errors_tree: ttk.Treeview | None = None
+        self._retry_tree: ttk.Treeview | None = None
         self._replies_tree: ttk.Treeview | None = None
         self._messages_notebook: ttk.Notebook | None = None
         self._messages_error_tab: ttk.Frame | None = None
+        self._messages_retry_tab: ttk.Frame | None = None
         self._messages_replies_tab: ttk.Frame | None = None
         # message_id -> ссылка на группу (сама модель Message в Data Service ссылку не хранит,
         # только lead_id — подтягиваем её через join с /leads на клиенте, см. _load_messages).
@@ -1212,16 +1214,20 @@ class App(tk.Tk):
         notebook.pack(fill="both", expand=True, padx=10, pady=(4, 4))
         all_tab = ttk.Frame(notebook)
         error_tab = ttk.Frame(notebook)
+        retry_tab = ttk.Frame(notebook)
         replies_tab = ttk.Frame(notebook)
         notebook.add(all_tab, text="Отправленные")
         notebook.add(error_tab, text="Ошибки")
+        notebook.add(retry_tab, text="Повторно")
         notebook.add(replies_tab, text="Ответили")
         self._messages_notebook = notebook
         self._messages_error_tab = error_tab
+        self._messages_retry_tab = retry_tab
         self._messages_replies_tab = replies_tab
 
         self._messages_tree = self._build_messages_tree(all_tab)
         self._errors_tree = self._build_messages_tree(error_tab)
+        self._retry_tree = self._build_messages_tree(retry_tab)
         self._replies_tree = self._build_messages_tree(replies_tab)
 
         reply_frame = ttk.Frame(win, padding=(10, 0, 10, 10))
@@ -1285,6 +1291,7 @@ class App(tk.Tk):
             tree.column(col, width=width, anchor="w")
         tree.tag_configure("sent", foreground="#2e9e4f")
         tree.tag_configure("failed", foreground="#c0392b")
+        tree.tag_configure("retry", foreground="#c9820a")
         tree.tag_configure("replied", background="#3a6df0", foreground="white")
         tree.pack(fill="both", expand=True)
         tree.bind("<Double-1>", lambda _event, t=tree: self._open_selected_message_link(t))
@@ -1301,6 +1308,8 @@ class App(tk.Tk):
         current = notebook.select()
         if self._messages_error_tab is not None and current == str(self._messages_error_tab):
             return self._errors_tree
+        if self._messages_retry_tab is not None and current == str(self._messages_retry_tab):
+            return self._retry_tree
         if self._messages_replies_tab is not None and current == str(self._messages_replies_tab):
             return self._replies_tree
         return self._messages_tree
@@ -1308,8 +1317,9 @@ class App(tk.Tk):
     def _load_messages(self) -> None:
         tree = self._messages_tree
         errors_tree = self._errors_tree
+        retry_tree = self._retry_tree
         replies_tree = self._replies_tree
-        if tree is None or errors_tree is None or replies_tree is None:
+        if tree is None or errors_tree is None or retry_tree is None or replies_tree is None:
             return
 
         def fetch():
@@ -1329,6 +1339,7 @@ class App(tk.Tk):
 
             tree.delete(*tree.get_children())
             errors_tree.delete(*errors_tree.get_children())
+            retry_tree.delete(*retry_tree.get_children())
             replies_tree.delete(*replies_tree.get_children())
             self._message_links = {}
             self._message_reply_targets = {}
@@ -1336,6 +1347,7 @@ class App(tk.Tk):
             for m in messages:
                 self._messages_by_lead.setdefault(m["lead_id"], []).append(m)
             error_count = 0
+            retry_count = 0
             reply_count = 0
             for m in sorted(messages, key=lambda m: m["sent_at"], reverse=True):
                 lead = leads_by_id.get(m["lead_id"], {})
@@ -1348,10 +1360,13 @@ class App(tk.Tk):
                 reply_text = RU_REPLY_STATUS.get(reply_status, reply_status)
                 when = (m.get("sent_at") or "")[:16].replace("T", " ")
                 # replied — самое заметное (это и есть входящее сообщение), пока строку не
-                # просмотрели (см. _on_message_row_selected); иначе как раньше: failed/sent по
-                # статусу доставки.
+                # просмотрели (см. _on_message_row_selected); pending — сетевой сбой (плохой
+                # интернет/страница не прогрузилась), не окончательная ошибка, см. tasks.py/
+                # reply.py::network_error — отдельным цветом, чтобы не путать с "Ошибки".
                 if reply_status == "replied" and m["id"] not in self._acknowledged_reply_ids:
                     tag = "replied"
+                elif status == "pending":
+                    tag = "retry"
                 else:
                     tag = "sent" if status == "sent" else "failed"
                 row_values = (
@@ -1361,6 +1376,9 @@ class App(tk.Tk):
                 if status == "failed":
                     errors_tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
                     error_count += 1
+                elif status == "pending":
+                    retry_tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
+                    retry_count += 1
                 elif reply_status == "replied":
                     replies_tree.insert("", "end", iid=m["id"], values=row_values, tags=(tag,))
                     reply_count += 1
@@ -1371,6 +1389,8 @@ class App(tk.Tk):
 
             if self._messages_notebook is not None and self._messages_error_tab is not None:
                 self._messages_notebook.tab(self._messages_error_tab, text=f"Ошибки ({error_count})")
+            if self._messages_notebook is not None and self._messages_retry_tab is not None:
+                self._messages_notebook.tab(self._messages_retry_tab, text=f"Повторно ({retry_count})")
             if self._messages_notebook is not None and self._messages_replies_tab is not None:
                 self._messages_notebook.tab(self._messages_replies_tab, text=f"Ответили ({reply_count})")
             self._on_message_row_selected(self._active_messages_tree())

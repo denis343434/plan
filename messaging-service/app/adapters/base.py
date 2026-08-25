@@ -20,6 +20,12 @@ class SendResult:
     # вызывающему коду отправить аккаунт в cooldown вместо повторной попытки на следующем лиде
     # той же мёртвой сессией.
     session_expired: bool = False
+    # Страница вообще не загрузилась (goto упал по таймауту/сети) — не проблема этого лида,
+    # а транзитный сбой (плохой интернет и т.п.), см. _PageLoadError в adapters/vk.py. tasks.py
+    # пишет такое сообщение как delivery_status="pending", а не "failed" — лид не попадает в
+    # previously_failed_lead_ids и ретраится обычным следующим запуском кампании сам, без ручного
+    # "Повторить с ошибками" (тот же принцип, что и в parser-service для _has_external_site).
+    network_error: bool = False
 
 
 class SendAdapter(Protocol):
