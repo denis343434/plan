@@ -192,8 +192,10 @@ class App(tk.Tk):
         # has_more в on_check_inbox/_poll_inbox_check) — сервер каждый батч считает с нуля
         # (limit=20 за раз), а прогресс в статусной строке должен расти по всей очереди.
         self._inbox_check_totals = {"checked": 0, "replied": 0}
-        # campaign_id, для которой сейчас идёт повторная рассылка по ошибкам (см.
-        # _poll_retry_send) — None, когда не запущена; не даёт запустить вторую поверх идущей.
+        # campaign_id, для которой сейчас идёт прямая рассылка мимо Orchestrator — новым лидам
+        # ("Запустить рассылку") или включая прежде проваленных ("Повторить с ошибками"), см.
+        # _start_direct_send/_poll_retry_send — None, когда не запущена; не даёт запустить
+        # вторую поверх идущей.
         self._retry_send_campaign_id: str | None = None
         # message_id, для которого сейчас отправляется ручной ответ — None, когда не идёт
         # отправка; не даёт запустить вторую поверх идущей (см. on_send_reply).
@@ -414,6 +416,7 @@ class App(tk.Tk):
         self.max_groups_entry.insert(0, "20")
         self.max_groups_entry.pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Запустить", style="Accent.TButton", command=self.on_start_campaign).pack(side="left", padx=2)
+        ttk.Button(btns, text="Запустить рассылку", command=self.on_start_new_leads_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Повторить с ошибками", command=self.on_retry_failed_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Обновить", command=self.refresh_detail).pack(side="left", padx=2)
         ttk.Button(btns, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(side="left", padx=2)
@@ -938,28 +941,44 @@ class App(tk.Tk):
 
         self.run_bg(start, on_done=done, on_error=error)
 
+    def on_start_new_leads_send(self) -> None:
+        # Только отправка, без retry_failed — те же ещё не тронутые (status=new) лиды, что и
+        # обычный запуск кампании подхватил бы на фазе рассылки, но без повторного парсинга и
+        # без прежде проваленных лидов (см. _start_direct_send). Нужна отдельно от "Запустить":
+        # если кампания встала на фазе рассылки (см. запрос пользователя 2026-08-25 — таймаут
+        # оркестратора при живой рассылке), "Запустить" гонял бы парсинг заново вхолостую.
+        self._start_direct_send(retry_failed=False)
+
     def on_retry_failed_send(self) -> None:
+        self._start_direct_send(retry_failed=True)
+
+    def _start_direct_send(self, retry_failed: bool) -> None:
         if not self.selected_campaign_id:
             return
         campaign_id = self.selected_campaign_id
         if self._retry_send_campaign_id is not None:
-            messagebox.showinfo("Рассылка", "Повторная рассылка уже идёт, дождитесь её окончания")
+            messagebox.showinfo("Рассылка", "Рассылка уже идёт, дождитесь её окончания")
             return
 
         self._retry_send_campaign_id = campaign_id
         self.detail_progress_bar.pack_forget()
-        self.detail_progress_label.configure(text="запускаю повторную рассылку…")
+        self.detail_progress_label.configure(text="запускаю рассылку…")
 
         def start():
             # Напрямую в Messaging Service, в обход Orchestrator — "Запустить" гоняет весь цикл
-            # заново (включая повторный парсинг), а нам нужно только повторить отправку.
-            # POST /campaigns/{id}/send рассылает всем лидам со status=new — туда как раз
-            # попадают лиды, у которых прошлая отправка провалилась без признаков флуда (см.
-            # messaging-service/app/tasks.py:_process_lead — такие лиды НЕ переводятся в
-            # "contacted", остаются "new" именно для повторной отправки), плюс любые ещё не
-            # тронутые лиды. retry_failed=true явно включает уже провалившихся лидов обратно в
-            # выборку — обычный запуск кампании их больше пропускает (см. run_send_task).
-            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send?retry_failed=true", method="POST")
+            # заново (включая повторный парсинг), а тут нужно только (пере)отправить уже
+            # найденным лидам, независимо от того, в каком состоянии застряла кампания у
+            # Orchestrator (paused/timeout и т.п. — Messaging Service статус кампании не
+            # проверяет, см. app/routers/send.py). POST /campaigns/{id}/send рассылает всем
+            # лидам со status=new — туда попадают лиды, у которых прошлая отправка провалилась
+            # без признаков флуда (см. messaging-service/app/tasks.py:_process_lead — такие лиды
+            # НЕ переводятся в "contacted", остаются "new" именно для повторной отправки), плюс
+            # любые ещё не тронутые лиды. retry_failed=true ("Повторить с ошибками") явно
+            # включает уже провалившихся лидов обратно в выборку — retry_failed=false
+            # ("Запустить рассылку") их пропускает, отправляя только новым/нетронутым лидам
+            # (см. run_send_task, previously_failed_lead_ids).
+            query = "?retry_failed=true" if retry_failed else ""
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/send{query}", method="POST")
 
         def started(_result):
             self.after(500, lambda: self._poll_retry_send(campaign_id))
@@ -986,7 +1005,7 @@ class App(tk.Tk):
             status = result["status"]
             if status in ("queued", "running"):
                 self.detail_progress_label.configure(
-                    text=f"Повторная рассылка: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+                    text=f"Рассылка: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
                 )
                 self.after(2000, lambda: self._poll_retry_send(campaign_id))
                 return
@@ -994,21 +1013,21 @@ class App(tk.Tk):
             self._retry_send_campaign_id = None
             if status == "failed":
                 self.detail_progress_label.configure(text="")
-                messagebox.showerror("Рассылка", result.get("error") or "не удалось повторить рассылку")
+                messagebox.showerror("Рассылка", result.get("error") or "не удалось запустить рассылку")
                 return
             if status == "waiting_for_account":
                 self.detail_progress_label.configure(
-                    text=f"Повторная рассылка приостановлена: нет свободного аккаунта "
+                    text=f"Рассылка приостановлена: нет свободного аккаунта "
                     f"(отправлено {result['sent']}, ошибок {result['failed']})"
                 )
-                self.flash_status("Повторная рассылка приостановлена: нет свободного аккаунта")
+                self.flash_status("Рассылка приостановлена: нет свободного аккаунта")
                 self.refresh_leads()
                 return
 
             self.detail_progress_label.configure(
-                text=f"Повторная рассылка завершена: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+                text=f"Рассылка завершена: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
             )
-            self.flash_status(f"Повторная рассылка: отправлено {result['sent']}, ошибок {result['failed']}")
+            self.flash_status(f"Рассылка: отправлено {result['sent']}, ошибок {result['failed']}")
             self.refresh_leads()
 
         def error(exc):
