@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -197,6 +198,20 @@ class App(tk.Tk):
         # _start_direct_send/_poll_retry_send — None, когда не запущена; не даёт запустить
         # вторую поверх идущей.
         self._retry_send_campaign_id: str | None = None
+        # Очередь кампаний ("Запустить очередь") — снапшот выбранных id/имён на момент старта,
+        # текущая позиция (-1 = очередь не идёт) и накопленные исходы для итоговой сводки.
+        # _queue_generation растёт при каждом старте/стопе очереди и используется теми же
+        # приёмом, что _bg_gen в run_bg — чтобы отложенные self.after-колбэки от прошлой
+        # очереди (уже остановленной или перезапущенной) не продолжали переключать кампании.
+        self._queue_campaign_ids: list[str] = []
+        self._queue_names: dict[str, str] = {}
+        self._queue_index: int = -1
+        self._queue_outcomes: list[tuple[str, str]] = []
+        self._queue_generation = 0
+        # Момент запуска текущего шага очереди (time.monotonic()) — по нему в статус-строке
+        # считаем секунды "идёт Xс", чтобы было видно, что процесс не завис, даже когда фаза и
+        # числа прогресса между опросами не меняются (например, "идёт поиск групп…").
+        self._queue_step_started_at: float = 0.0
         # message_id, для которого сейчас отправляется ручной ответ — None, когда не идёт
         # отправка; не даёт запустить вторую поверх идущей (см. on_send_reply).
         self._reply_send_message_id: str | None = None
@@ -389,16 +404,29 @@ class App(tk.Tk):
         ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_campaign).grid(row=0, column=3, padx=4)
 
         cols = ("name", "keyword", "status")
-        self.camp_tree = ttk.Treeview(panel, columns=cols, show="headings", height=6)
+        self.camp_tree = ttk.Treeview(panel, columns=cols, show="headings", height=6, selectmode="extended")
         for col, title, width in (("name", "Название", 150), ("keyword", "Ключевое слово", 140), ("status", "Статус", 110)):
             self.camp_tree.heading(col, text=title)
             self.camp_tree.column(col, width=width, anchor="w")
         self.camp_tree.pack(fill="both", expand=True)
         self.camp_tree.bind("<<TreeviewSelect>>", self.on_select_campaign)
 
+        ttk.Label(
+            panel, text="Ctrl+клик — выбрать несколько для очереди", foreground="#999", font=("Segoe UI", 8)
+        ).pack(anchor="w")
+
         camp_actions = ttk.Frame(panel)
         camp_actions.pack(fill="x", pady=(6, 0))
-        ttk.Button(camp_actions, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(side="left")
+        ttk.Button(camp_actions, text="Запустить очередь", style="Success.TButton", command=self.on_start_queue).pack(
+            side="left"
+        )
+        ttk.Button(camp_actions, text="Остановить очередь", command=self.on_stop_queue).pack(side="left", padx=(6, 0))
+        ttk.Button(camp_actions, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(
+            side="left", padx=(6, 0)
+        )
+
+        self.queue_status_label = ttk.Label(panel, text="", foreground="#555", wraplength=320)
+        self.queue_status_label.pack(fill="x", pady=(6, 0))
         return panel
 
     def _build_detail_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -806,13 +834,20 @@ class App(tk.Tk):
             return api_request(DATA_URL, "/campaigns")
 
         def done(campaigns):
+            prev_selection = self.camp_tree.selection()
             self.camp_tree.delete(*self.camp_tree.get_children())
             for c in campaigns:
                 self.camp_tree.insert(
                     "", "end", iid=c["id"],
                     values=(c["name"], c["keyword"], RU_CAMPAIGN_STATUS.get(c["status"], c["status"])),
                 )
-            if self.selected_campaign_id and self.camp_tree.exists(self.selected_campaign_id):
+            # Восстанавливаем мультивыбор (см. очередь, on_start_queue) — иначе периодический
+            # тик (REFRESH_LIST_MS) сбрасывал бы ctrl-click выбор ещё до того, как пользователь
+            # успеет нажать "Запустить очередь".
+            still_there = [cid for cid in prev_selection if self.camp_tree.exists(cid)]
+            if still_there:
+                self.camp_tree.selection_set(still_there)
+            elif self.selected_campaign_id and self.camp_tree.exists(self.selected_campaign_id):
                 self.camp_tree.selection_set(self.selected_campaign_id)
 
         def error(exc):
@@ -940,6 +975,125 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка запуска", str(exc))
 
         self.run_bg(start, on_done=done, on_error=error)
+
+    # ---------- очередь кампаний ----------
+    def on_start_queue(self) -> None:
+        selected = self.camp_tree.selection()
+        if len(selected) < 2:
+            messagebox.showinfo("Очередь", "Выберите минимум 2 кампании (Ctrl+клик) для запуска очереди")
+            return
+        if self._queue_index != -1:
+            messagebox.showinfo("Очередь", "Очередь уже выполняется")
+            return
+
+        self._queue_campaign_ids = list(selected)
+        self._queue_names = {cid: self.camp_tree.item(cid, "values")[0] for cid in selected}
+        self._queue_index = 0
+        self._queue_outcomes = []
+        self._queue_generation += 1
+        self._queue_start_current()
+
+    def on_stop_queue(self) -> None:
+        if self._queue_index == -1:
+            return
+        # Гасим отложенные self.after-колбэки текущего цикла старта/опроса (тот же приём,
+        # что _bg_gen в run_bg) — сама уже запущенная у оркестратора кампания доработает
+        # сама (у orchestrator-service нет endpoint'а отмены), просто клиент больше не
+        # переходит к следующим кампаниям очереди.
+        self._queue_generation += 1
+        self._queue_index = -1
+        self.queue_status_label.configure(text="Очередь остановлена (текущая кампания доработает сама)")
+
+    def _queue_start_current(self) -> None:
+        generation = self._queue_generation
+        campaign_id = self._queue_campaign_ids[self._queue_index]
+        name = self._queue_names.get(campaign_id, campaign_id)
+        total = len(self._queue_campaign_ids)
+        self.queue_status_label.configure(text=f"Очередь: {self._queue_index + 1}/{total} — «{name}»: запуск…")
+        self._queue_step_started_at = time.monotonic()
+        self.select_campaign(campaign_id, name)
+
+        raw_limit = self.max_groups_entry.get().strip()
+        path = f"/campaigns/{campaign_id}/start"
+        if raw_limit:
+            # В очереди не блокируем весь прогон модалкой из-за опечатки в поле — просто
+            # без ограничения на число групп для этого шага (в отличие от on_start_campaign,
+            # где это единичный ручной запуск и есть кому ответить на предупреждение).
+            try:
+                max_groups = int(raw_limit)
+                if max_groups > 0:
+                    path += f"?max_groups={max_groups}"
+            except ValueError:
+                pass
+
+        def start():
+            return api_request(ORCHESTRATOR_URL, path, method="POST")
+
+        def started(_result):
+            if generation != self._queue_generation:
+                return
+            self.after(1000, lambda: self._queue_poll(campaign_id, generation))
+
+        def error(exc):
+            if generation != self._queue_generation:
+                return
+            self._queue_outcomes.append((name, f"ошибка запуска: {exc}"))
+            self._queue_advance(generation)
+
+        self.run_bg(start, on_done=started, on_error=error)
+
+    def _queue_poll(self, campaign_id: str, generation: int) -> None:
+        if generation != self._queue_generation:
+            return
+
+        def fetch():
+            return api_request(ORCHESTRATOR_URL, f"/campaigns/{campaign_id}")
+
+        def done(data):
+            if generation != self._queue_generation:
+                return
+            phase = data.get("phase")
+            name = self._queue_names.get(campaign_id, campaign_id)
+            total = len(self._queue_campaign_ids)
+            elapsed = int(time.monotonic() - self._queue_step_started_at)
+            text = f"Очередь: {self._queue_index + 1}/{total} — «{name}»: {RU_PHASE.get(phase, phase)} ({elapsed}с)"
+            # Числа прогресса (проверено/найдено при парсинге, отправлено/ошибок при рассылке)
+            # меняются между опросами — без них строка выглядит "зависшей", даже когда всё
+            # идёт нормально (см. запрос пользователя "не понятно идёт ли парсинг или нет").
+            progress_text = self._progress_text(phase, data.get("progress"))
+            if progress_text:
+                text += f" · {progress_text}"
+            if data.get("error"):
+                text += f" · ошибка: {data['error']}"
+            elif data.get("note"):
+                text += f" · {data['note']}"
+            self.queue_status_label.configure(text=text)
+            if phase in ("done", "failed", "timeout"):
+                self._queue_outcomes.append((name, RU_PHASE.get(phase, phase)))
+                self._queue_advance(generation)
+                return
+            self.after(REFRESH_DETAIL_MS, lambda: self._queue_poll(campaign_id, generation))
+
+        def error(_exc):
+            # Разовый сбой сети не должен ронять всю очередь — просто повторяем опрос.
+            if generation != self._queue_generation:
+                return
+            self.after(REFRESH_DETAIL_MS, lambda: self._queue_poll(campaign_id, generation))
+
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key=f"queue_poll_{campaign_id}")
+
+    def _queue_advance(self, generation: int) -> None:
+        if generation != self._queue_generation:
+            return
+        self._queue_index += 1
+        if self._queue_index >= len(self._queue_campaign_ids):
+            summary = "; ".join(f"{name} — {outcome}" for name, outcome in self._queue_outcomes)
+            self.queue_status_label.configure(text=f"Очередь завершена: {summary}")
+            self.flash_status("Очередь кампаний завершена")
+            self._queue_index = -1
+            self.refresh_campaigns()
+            return
+        self._queue_start_current()
 
     def on_start_new_leads_send(self) -> None:
         # Только отправка, без retry_failed — те же ещё не тронутые (status=new) лиды, что и
@@ -1069,6 +1223,25 @@ class App(tk.Tk):
         self.refresh_leads()
         self.refresh_templates()
 
+    @staticmethod
+    def _progress_text(phase: str | None, progress: dict | None) -> str:
+        # Общий текст прогресса для панели деталей (_update_progress) и статус-строки очереди
+        # (_queue_poll) — те же числа, что реально меняются между опросами, а не просто
+        # название фазы, которое выглядит "зависшим" на глаз, даже когда всё идёт нормально.
+        if not progress or phase not in ("parsing", "messaging"):
+            return ""
+        if phase == "parsing":
+            checked = progress.get("checked", 0)
+            total = progress.get("total", 0)
+            found = progress.get("found", 0)
+            if total > 0:
+                return f"Парсинг: проверено {checked}/{total} групп, подходит (без сайта): {found}"
+            return "Парсинг: идёт поиск групп…"
+        sent = progress.get("sent", 0)
+        failed = progress.get("failed", 0)
+        skipped = progress.get("skipped", 0)
+        return f"Рассылка: отправлено {sent}, ошибок {failed}, пропущено {skipped}"
+
     def _update_progress(self, phase: str | None, progress: dict | None) -> None:
         if not progress or phase not in ("parsing", "messaging"):
             self.detail_progress_label.configure(text="")
@@ -1078,23 +1251,15 @@ class App(tk.Tk):
         if phase == "parsing":
             checked = progress.get("checked", 0)
             total = progress.get("total", 0)
-            found = progress.get("found", 0)
             if total > 0:
                 self.detail_progress_bar["maximum"] = total
                 self.detail_progress_bar["value"] = checked
                 self.detail_progress_bar.pack(side="left", padx=(10, 0))
-                self.detail_progress_label.configure(
-                    text=f"Парсинг: проверено {checked}/{total} групп, подходит (без сайта): {found}"
-                )
             else:
                 self.detail_progress_bar.pack_forget()
-                self.detail_progress_label.configure(text="Парсинг: идёт поиск групп…")
         else:  # messaging
             self.detail_progress_bar.pack_forget()
-            sent = progress.get("sent", 0)
-            failed = progress.get("failed", 0)
-            skipped = progress.get("skipped", 0)
-            self.detail_progress_label.configure(text=f"Рассылка: отправлено {sent}, ошибок {failed}, пропущено {skipped}")
+        self.detail_progress_label.configure(text=self._progress_text(phase, progress))
 
     def refresh_leads(self) -> None:
         campaign_id = self.selected_campaign_id
