@@ -73,7 +73,7 @@ services:
       PARSER_SERVICE_URL: http://parser-service:8000
       MESSAGING_SERVICE_URL: http://messaging-service:8000
       POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-5}
-      POLL_TIMEOUT_SEC: ${POLL_TIMEOUT_SEC:-1800}
+      POLL_STALL_TIMEOUT_SEC: ${POLL_STALL_TIMEOUT_SEC:-1800}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       - data-service

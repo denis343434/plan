@@ -150,12 +150,24 @@ def _poll(
     is_failed: Callable[[dict], bool],
     on_status: Callable[[dict], None] | None = None,
     interval: float | None = None,
-    timeout: float | None = None,
+    stall_timeout: float | None = None,
 ) -> tuple[str, dict]:
-    """Poll fetch_status() until is_done/is_failed or timeout. Returns (outcome, last_status)."""
+    """Poll fetch_status() until is_done/is_failed, or until the status stops changing for
+    stall_timeout secs. Returns (outcome, last_status).
+
+    Раньше таймаут был жёстким потолком на всю фазу (POLL_TIMEOUT_SEC от старта поллинга) — на
+    крупных кампаниях (сотни лидов) это ловило ещё живой, просто медленный прогресс (парсинг с
+    паузами между кандидатами, рассылка с паузами между сообщениями) как "зависло", хотя
+    status.progress исправно рос (см. запрос пользователя 2026-09-03, скриншот "фаза: таймаут ·
+    ошибка: messaging: running" на кампании, которая ещё писала сообщения). Теперь таймаут не по
+    общему времени фазы, а по времени БЕЗ изменений в status — зависшая (реально не отвечающая)
+    задача по-прежнему ловится, а живая медленная — нет.
+    """
     interval = settings.POLL_INTERVAL_SEC if interval is None else interval
-    timeout = settings.POLL_TIMEOUT_SEC if timeout is None else timeout
-    deadline = time.monotonic() + timeout
+    stall_timeout = settings.POLL_STALL_TIMEOUT_SEC if stall_timeout is None else stall_timeout
+
+    last_status: dict | None = None
+    stalled_since = time.monotonic()
 
     while True:
         status = fetch_status()
@@ -165,6 +177,10 @@ def _poll(
             return "done", status
         if is_failed(status):
             return "failed", status
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if status != last_status:
+            last_status = status
+            stalled_since = now
+        elif now - stalled_since >= stall_timeout:
             return "timeout", status
         time.sleep(interval)

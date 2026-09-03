@@ -61,7 +61,8 @@ curl http://localhost:8004/campaigns/{campaign_id}
 
 1. `GET /campaigns/{id}` в Data Service, статус кампании → `running`.
 2. `POST /parse` в Parser Service, поллинг `GET /parse/{task_id}/status` каждые
-   `POLL_INTERVAL_SEC` до `done`/`failed`/таймаута `POLL_TIMEOUT_SEC`.
+   `POLL_INTERVAL_SEC` до `done`/`failed`/остановки прогресса дольше `POLL_STALL_TIMEOUT_SEC`
+   (таймаут по отсутствию изменений в статусе, не по общему времени фазы).
 3. Если парсинг `done` → `POST /campaigns/{id}/send` в Messaging Service, аналогичный поллинг
    `GET /campaigns/{id}/send-status` (`waiting_for_account` тоже считается терминальной
    неудачей для поллинга — сам по себе он не рассосётся без внешнего вмешательства).

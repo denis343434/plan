@@ -4,6 +4,7 @@ import re
 import time
 from typing import Callable
 
+from playwright._impl._errors import TargetClosedError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from app.adapters.base import CaptchaDetectedError, ParseFilters, RawLead
@@ -324,6 +325,16 @@ class VkParserAdapter:
             try:
                 page.goto(group_url, wait_until="domcontentloaded")
                 break
+            except TargetClosedError:
+                # Браузер/страница закрылись целиком (краш вкладки и т.п.), а не сбой конкретного
+                # goto — ретраить и продолжать перебор кандидатов бессмысленно, КАЖДЫЙ следующий
+                # goto в этом же прогоне упадёт той же ошибкой. Раньше это тихо ловилось общим
+                # except ниже и цикл в search_communities долбил закрытый браузер по кандидату в
+                # секунду, пока не выбирал весь список — на кампании в сотни групп так уходило
+                # больше POLL_TIMEOUT_SEC оркестратора (см. запрос пользователя 2026-09-03, лог
+                # 338 подряд TargetClosedError, "фаза: таймаут · ошибка: parser: running").
+                # Пробрасываем наверх, чтобы весь search_communities прервался сразу.
+                raise
             except Exception:
                 if attempt == 0:
                     time.sleep(1.0)
@@ -340,6 +351,8 @@ class VkParserAdapter:
             # цикле получил бы ту же мёртвую сессию, см. запрос пользователя 2026-08-24).
             _raise_if_login_required(page)
             return False  # страница уже загрузилась (goto прошёл) — поля просто нет, сайта нет
+        except TargetClosedError:
+            raise  # см. комментарий у goto выше — браузер мёртв целиком, не сбой этого кандидата
         except Exception:
             logger.warning("failed to check site presence for %s, skipping (unknown site status)", group_url, exc_info=True)
             return None

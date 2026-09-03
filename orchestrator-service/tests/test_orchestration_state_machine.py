@@ -165,7 +165,7 @@ def test_flow_stops_when_messaging_waits_for_account():
 @respx.mock
 def test_flow_times_out_when_parser_never_finishes(monkeypatch):
     monkeypatch.setattr(settings, "POLL_INTERVAL_SEC", 0.01)
-    monkeypatch.setattr(settings, "POLL_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(settings, "POLL_STALL_TIMEOUT_SEC", 0.05)
 
     campaign_id = str(uuid.uuid4())
     task_id = str(uuid.uuid4())

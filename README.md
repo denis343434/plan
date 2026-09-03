@@ -149,7 +149,7 @@ curl "http://localhost:8001/messages?account_id=<account_id>"
 - `VK_ADAPTER_MODE=playwright` (реальный VK) в этом smoke-флоу не проверяется — нужен
   залогиненный аккаунт, см. `parser-service/scripts/vk_manual_login.py` /
   `messaging-service/scripts/vk_manual_login.py`.
-- Стадии `parsing`/`messaging` опрашиваются поллингом (`POLL_INTERVAL_SEC`/`POLL_TIMEOUT_SEC`
+- Стадии `parsing`/`messaging` опрашиваются поллингом (`POLL_INTERVAL_SEC`/`POLL_STALL_TIMEOUT_SEC`
   в `orchestrator-service`), без брокера очередей — соответствует MVP-решению в `architecture.md`.
 
 ## Локальная разработка отдельных сервисов
