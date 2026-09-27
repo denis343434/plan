@@ -3,10 +3,35 @@ from app.adapters.registry import get_adapter, get_inbox_adapter
 from app.config import settings
 
 
-def test_tg_and_instagram_always_use_dryrun_adapter():
-    for platform in ("tg", "instagram"):
-        adapter = get_adapter(platform)
-        assert isinstance(adapter, DryRunAdapter)
+def test_tg_always_uses_dryrun_adapter():
+    adapter = get_adapter("tg")
+    assert isinstance(adapter, DryRunAdapter)
+
+
+def test_instagram_uses_dryrun_adapter_by_default():
+    assert settings.IG_ADAPTER_MODE == "fake"
+    adapter = get_adapter("instagram")
+    assert isinstance(adapter, DryRunAdapter)
+
+
+def test_instagram_uses_playwright_adapter_when_configured(monkeypatch):
+    monkeypatch.setattr(settings, "IG_ADAPTER_MODE", "playwright")
+
+    adapter = get_adapter("instagram", storage_state={"cookies": []})
+
+    from app.adapters.instagram import InstagramSendAdapter
+
+    assert isinstance(adapter, InstagramSendAdapter)
+
+
+def test_instagram_uses_playwright_inbox_adapter_when_configured(monkeypatch):
+    monkeypatch.setattr(settings, "IG_ADAPTER_MODE", "playwright")
+
+    adapter = get_inbox_adapter("instagram", storage_state={"cookies": []})
+
+    from app.adapters.instagram import InstagramInboxAdapter
+
+    assert isinstance(adapter, InstagramInboxAdapter)
 
 
 def test_vk_uses_dryrun_adapter_by_default():

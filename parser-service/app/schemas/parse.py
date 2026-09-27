@@ -13,6 +13,9 @@ class ParseRequest(BaseModel):
     keyword: str
     filters: ParseFiltersSchema = ParseFiltersSchema()
     campaign_id: UUID | None = None
+    # True (по умолчанию) — парсинг через сохранённую сессию аккаунта (прежнее единственное
+    # поведение), False — анонимным браузером без логина. См. app/tasks.py::run_parse_task.
+    use_account: bool = True
 
 
 class ParseTaskOut(BaseModel):

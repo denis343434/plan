@@ -48,7 +48,7 @@ def test_create_campaign_proxies_to_data_service_as_is():
     assert resp.json()["id"] == campaign_id
 
     sent_body = json.loads(create_route.calls.last.request.content)
-    assert sent_body == {"name": "test", "platform": "vk", "keyword": "fitness"}
+    assert sent_body == {"name": "test", "platform": "vk", "keyword": "fitness", "use_account": True}
 
 
 @respx.mock

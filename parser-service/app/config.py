@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     # has_site=False) простаивала полный таймаут, прежде чем adapter решал, что сайта нет.
     VK_SITE_CHECK_TIMEOUT_MS: int = 4000
 
+    IG_ADAPTER_MODE: str = "fake"  # fake | playwright
+    IG_HEADLESS: bool = True
+    # Instagram банит/чекпоинтит агрессивнее VK — держим более консервативные задержки между
+    # проверяемыми кандидатами по умолчанию, чем VK-аналог (MIN_DELAY_SEC/MAX_DELAY_SEC).
+    IG_MIN_DELAY_SEC: float = 3.0
+    IG_MAX_DELAY_SEC: float = 6.0
+    # Таймаут ожидания шапки профиля (см. adapters/instagram.py::_has_bio_link) — по аналогии с
+    # VK_SITE_CHECK_TIMEOUT_MS, но своё значение: разметка и скорость рендера Instagram другие.
+    IG_BIO_CHECK_TIMEOUT_MS: int = 4000
+
     LOG_LEVEL: str = "INFO"
 
 

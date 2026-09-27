@@ -186,3 +186,66 @@ def test_stub_platform_task_completes_done_without_touching_accounts():
     assert task.status == TaskStatus.done
     assert task.found == 0
     assert task.inserted == 0
+
+
+@respx.mock
+def test_vk_task_without_account_skips_account_pool_but_still_dedupes(monkeypatch):
+    """use_account=False не должен трогать /accounts/* вообще, но dedup-лист (список уже
+    известных лидов) всё равно должен запрашиваться и доходить до адаптера."""
+    next_available_route = respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(str(uuid.uuid4())))
+    )
+    leads_route = respx.get(f"{BASE}/leads").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(uuid.uuid4()),
+                    "platform": "vk",
+                    "external_id": "already_known_group",
+                    "group_url": "https://vk.com/already_known_group",
+                    "admin_contact": None,
+                    "title": "Known",
+                    "status": "new",
+                    "campaign_id": None,
+                    "found_at": "2026-01-01T00:00:00",
+                }
+            ],
+        )
+    )
+    respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
+    )
+
+    captured_filters = {}
+    captured_calls = []
+
+    class _CapturingAdapter:
+        def search_communities(self, keyword, filters, on_progress=None):
+            captured_filters["filters"] = filters
+            if on_progress is not None:
+                on_progress(0, 0, 0)
+            return []
+
+    def _get_adapter(platform, storage_state=None):
+        captured_calls.append(storage_state)
+        return _CapturingAdapter()
+
+    monkeypatch.setattr("app.tasks.get_adapter", _get_adapter)
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None, use_account=False)
+
+    assert task.status == TaskStatus.done
+    assert not next_available_route.called
+    assert leads_route.called
+    assert captured_filters["filters"].known_external_ids == frozenset({"already_known_group"})
+    assert captured_calls == [None]  # get_adapter вызван без storage_state — анонимный режим
+
+
+def test_instagram_task_without_account_fails_fast_without_touching_accounts():
+    task = create_task("instagram", "fitness")
+    run_parse_task(task.task_id, "instagram", "fitness", ParseFiltersSchema(), None, use_account=False)
+
+    assert task.status == TaskStatus.failed
+    assert "без аккаунта" in task.error

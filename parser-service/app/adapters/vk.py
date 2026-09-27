@@ -3,6 +3,7 @@ import random
 import re
 import time
 from typing import Callable
+from urllib.parse import quote
 
 from playwright._impl._errors import TargetClosedError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
@@ -75,6 +76,30 @@ _SESSION_CHECK_TIMEOUT_MS = 15_000
 # уже чинили для messaging-service/app/adapters/vk.py, здесь дублируем по тому же принципу).
 # НЕ проверено вживую под devtools — заведено по скриншоту, а не по разметке.
 _LOGIN_REQUIRED_TEXT = "Выберите аккаунт для входа"
+
+# Анонимный режим (use_account=False у кампании, см. app/tasks.py::run_parse_task) — SPA-поиск
+# через шапку ленты (_open_communities_search выше) доступен только залогиненным: без cookies
+# VK отдаёт на /feed публичную посадочную/логин-страницу, там нет ни ленты, ни строки поиска, и
+# wait_for_selector на _SEARCH_INPUT_SELECTOR просто отвалится по таймауту. Единственный
+# известный путь без аккаунта — классический URL поиска "c[section]=/c[q]=", годами открытый
+# гостям (в отличие от современной SPA-выдачи, которую и обслуживает код выше).
+#
+# НЕ проверено вживую: ни этот URL, ни разметка результатов на нём не сверялись через devtools
+# на реальном запросе. Вместо конкретных CSS-классов (которые почти наверняка со временем
+# менялись и здесь были бы чистой угадайкой) используем структурный признак — ссылка вида
+# "/короткое_имя" или "/club12345"/"/public12345", как у любого паблика VK — тот же приём, что
+# уже применялся в этом файле для поля "сайт" (см. _SITE_FIELD_SELECTOR), только на разметку
+# результатов легаси-поиска. При первом реальном прогоне анонимного режима свериться через
+# VK_HEADLESS=false и обновить, если верстка окажется другой.
+_ANON_SEARCH_URL_TEMPLATE = "https://vk.com/search?c%5Bsection%5D=communities&c%5Bq%5D={query}"
+_ANON_RESULT_LINK_PATTERN = re.compile(r"^/(club\d+|public\d+|event\d+|[a-zA-Z][a-zA-Z0-9_.]{1,31})$")
+# Технические внутренние ссылки VK, которые попадаются в шапке/подвале даже анонимному гостю и
+# формально проходят под _ANON_RESULT_LINK_PATTERN — исключаем по имени сегмента, а не гадаем
+# точный контейнер результатов, который на легаси-странице не проверен.
+_ANON_IGNORED_PATH_SEGMENTS = {
+    "search", "feed", "im", "settings", "id", "away", "help", "support", "privacy", "terms",
+    "about", "apps", "video", "audio", "friends", "dev", "job", "logout", "login",
+}
 
 
 class SessionExpiredError(Exception):
@@ -163,22 +188,25 @@ class VkParserAdapter:
             _block_heavy_resources(context)
             page = context.new_page()
             try:
-                self._open_communities_search(page, keyword, leads)
+                if self._storage_state:
+                    self._open_communities_search(page, keyword, leads)
 
-                try:
-                    page.wait_for_selector(_GROUP_CARD_SELECTOR, timeout=15_000)
-                except PlaywrightTimeoutError:
-                    pass  # ни одной группы по запросу — не ошибка, просто пустой результат
+                    try:
+                        page.wait_for_selector(_GROUP_CARD_SELECTOR, timeout=15_000)
+                    except PlaywrightTimeoutError:
+                        pass  # ни одной группы по запросу — не ошибка, просто пустой результат
 
-                if filters.max_groups is not None:
-                    self._scroll_until_enough_new_candidates(page, filters)
+                    if filters.max_groups is not None:
+                        self._scroll_until_enough_new_candidates(page, filters)
 
-                candidates = [
-                    lead
-                    for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
-                    if (lead := self._parse_card(card, filters)) is not None
-                    and lead.external_id not in filters.known_external_ids
-                ]
+                    candidates = [
+                        lead
+                        for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
+                        if (lead := self._parse_card(card, filters)) is not None
+                        and lead.external_id not in filters.known_external_ids
+                    ]
+                else:
+                    candidates = self._search_communities_anonymous(page, keyword, filters, leads)
 
                 # filters.has_site is True — явный запрос "только с сайтом", инвертируем;
                 # False/None (дефолт) — обычное поведение парсера: сайт есть → лид не нужен
@@ -258,6 +286,87 @@ class VkParserAdapter:
             return  # все найденные сообщества уже показаны прямо тут, докручивать некуда
         show_all.click()
         page.wait_for_timeout(1500)  # переход внутри SPA, не полная навигация — короткая пауза
+
+    def _search_communities_anonymous(
+        self, page: Page, keyword: str, filters: ParseFilters, collected_so_far: list[RawLead]
+    ) -> list[RawLead]:
+        """Анонимный аналог _open_communities_search (см. комментарий у _ANON_SEARCH_URL_TEMPLATE
+        про то, почему это отдельный путь, а не переиспользование SPA-поиска). Докрутка выдачи
+        здесь грубее, чем в авторизованной ветке — легаси-страница без проверенной вживую
+        разметки, поэтому max_groups для анонимного режима стоит считать более приблизительным."""
+        url = _ANON_SEARCH_URL_TEMPLATE.format(query=quote(keyword))
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+        except TargetClosedError:
+            raise  # браузер мёртв целиком — см. тот же приём и комментарий у _has_external_site
+        except Exception:
+            logger.warning("anonymous VK search failed to load %s", url, exc_info=True)
+            return []
+        page.wait_for_timeout(2000)  # легаси-страница без SPA-роутинга — простая пауза на рендер
+        self._raise_if_captcha(page, collected_so_far)
+
+        if filters.max_groups is not None:
+            self._scroll_anonymous_until_enough_new(page, filters)
+
+        seen_ids: set[str] = set()
+        candidates: list[RawLead] = []
+        for link in page.query_selector_all("a[href]"):
+            lead = self._parse_anon_link(link)
+            if lead is None or lead.external_id in seen_ids:
+                continue
+            seen_ids.add(lead.external_id)
+            if lead.external_id in filters.known_external_ids:
+                continue
+            candidates.append(lead)
+        return candidates
+
+    def _scroll_anonymous_until_enough_new(self, page: Page, filters: ParseFilters) -> None:
+        # Тот же приём, что и _scroll_until_enough_new_candidates, но по общему count() ссылок
+        # страницы вместо карточек SPA — легаси-страница может не иметь бесконечного скролла
+        # вовсе (пагинация вместо докрутки), тогда цикл просто быстро остановится по stalls.
+        def count_new() -> int:
+            seen: set[str] = set()
+            total = 0
+            for link in page.query_selector_all("a[href]"):
+                lead = self._parse_anon_link(link)
+                if lead is None or lead.external_id in seen:
+                    continue
+                seen.add(lead.external_id)
+                if lead.external_id not in filters.known_external_ids:
+                    total += 1
+            return total
+
+        max_groups = filters.max_groups
+        stalls = 0
+        total_loaded = len(page.query_selector_all("a[href]"))
+        for _ in range(_MAX_SCROLL_ATTEMPTS):
+            if max_groups is not None and count_new() >= max_groups:
+                return
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(_SCROLL_WAIT_MS)
+            current_total = len(page.query_selector_all("a[href]"))
+            if current_total == total_loaded:
+                stalls += 1
+                if stalls >= _NO_GROWTH_STALLS_TO_STOP:
+                    return
+                continue
+            stalls = 0
+            total_loaded = current_total
+
+    def _parse_anon_link(self, link) -> RawLead | None:
+        href = link.get_attribute("href") or ""
+        path = href.split("?", 1)[0]
+        for prefix in ("https://vk.com", "https://vk.ru", "http://vk.com", "http://vk.ru"):
+            if path.startswith(prefix):
+                path = path[len(prefix):]
+                break
+        if not _ANON_RESULT_LINK_PATTERN.match(path):
+            return None
+        external_id = path.lstrip("/")
+        if external_id.split(".", 1)[0] in _ANON_IGNORED_PATH_SEGMENTS:
+            return None
+        title = (link.inner_text() or "").strip() or None
+        return RawLead(external_id=external_id, group_url=f"https://vk.com/{external_id}", title=title)
 
     def _wait_for_header_containing(self, page: Page, label: str, timeout: int) -> bool:
         """True, если за timeout мс среди [data-testid="header"] появился хотя бы один с

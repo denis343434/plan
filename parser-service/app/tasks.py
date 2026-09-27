@@ -56,6 +56,7 @@ def run_parse_task(
     keyword: str,
     filters: ParseFiltersSchema,
     campaign_id: uuid.UUID | None,
+    use_account: bool = True,
 ) -> None:
     task = TASKS[task_id]
     task.status = TaskStatus.running
@@ -66,12 +67,25 @@ def run_parse_task(
     try:
         parse_filters = ParseFilters(has_site=filters.has_site, max_groups=filters.max_groups)
 
-        if platform == "vk":
+        # Instagram блокирует анонимный доступ значительно агрессивнее VK (см. plan-instagram.md) —
+        # у адаптера попросту нет рабочего анонимного пути (поиск/просмотр профиля упираются в
+        # login wall почти сразу), поэтому эту комбинацию отклоняем сразу и явно, а не запускаем
+        # браузер на заведомо провальный прогон, который просто зависнет на таймаутах.
+        if platform == "instagram" and not use_account:
+            task.status = TaskStatus.failed
+            task.error = "Instagram не поддерживает парсинг без аккаунта — включите режим «в аккаунте»"
+            return
+
+        requires_browser = platform in ("vk", "instagram")
+        if requires_browser and use_account:
             try:
                 account = client.next_available_account(
                     platform=platform, purpose="parsing", task_ref=str(task_id)
                 )
             except NoAccountAvailableError:
+                # Аккаунта нет — выходим сразу, ДО запроса dedup-листа ниже: он не бесплатный
+                # (ходит в Data Service) и всё равно бесполезен, раз парсинг в этом прогоне не
+                # состоится вообще.
                 task.status = TaskStatus.failed
                 task.error = "no account available"
                 return
@@ -79,19 +93,25 @@ def run_parse_task(
             account_id = account["id"]
             session = client.get_session(account_id)
             adapter = get_adapter(platform, storage_state=session["storage_state"])
+        else:
+            # use_account=False (или платформа без реального адаптера) — не трогаем пул
+            # аккаунтов вообще: анонимный режим открывает браузер без сохранённой сессии (см.
+            # adapters/vk.py — при пустом storage_state контекст Playwright создаётся без
+            # cookies, ровно как для гостя). Ни lock/release, ни cooldown тут не при чём —
+            # аккаунт в этом прогоне не занимается.
+            adapter = get_adapter(platform)
 
-            # Уже известные (по любой кампании — дедуп в Data Service глобальный по platform,
-            # см. uq_leads_platform_external_id) группы адаптер пропускает и докручивает выдачу
-            # дальше вместо того, чтобы на каждом запуске находить один и тот же верхний срез
-            # результатов поиска VK (см. ParseFilters.known_external_ids).
+        # Dedup-лист (см. ParseFilters.known_external_ids) нужен любому платформенному адаптеру,
+        # требующему браузер (vk, instagram), независимо от того, используется ли аккаунт —
+        # список уже известных лидов приходит из Data Service, а не из сессии аккаунта. Считаем
+        # его уже после того, как решили, что парсинг вообще состоится (см. return выше).
+        if requires_browser:
             try:
                 parse_filters.known_external_ids = frozenset(
                     lead["external_id"] for lead in client.list_leads(platform=platform)
                 )
             except DataServiceError:
                 logger.exception("failed to fetch known leads for dedup-aware parsing, proceeding without it")
-        else:
-            adapter = get_adapter(platform)
 
         def on_progress(checked: int, total: int, found: int) -> None:
             task.progress_checked = checked

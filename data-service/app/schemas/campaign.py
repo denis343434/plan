@@ -11,12 +11,14 @@ class CampaignCreate(BaseModel):
     platform: Platform
     keyword: str
     template_id: UUID | None = None
+    use_account: bool = True
 
 
 class CampaignUpdate(BaseModel):
     name: str | None = None
     status: CampaignStatus | None = None
     template_id: UUID | None = None
+    use_account: bool | None = None
 
 
 class CampaignOut(BaseModel):
@@ -27,5 +29,6 @@ class CampaignOut(BaseModel):
     platform: Platform
     keyword: str
     template_id: UUID | None
+    use_account: bool
     status: CampaignStatus
     created_at: datetime

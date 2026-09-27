@@ -109,8 +109,13 @@ def _resolve_templates(client: DataServiceClient, campaign_id: uuid.UUID) -> lis
 
     # GET /templates не фильтрует по campaign_id (нет такого параметра в Data Service) —
     # фильтруем на своей стороне, это и даёт настоящую A/B-ротацию, если под кампанию
-    # заведено несколько вариантов шаблона с одинаковым campaign_id.
-    templates = [t for t in client.list_templates() if t.get("campaign_id") == str(campaign_id)]
+    # заведено несколько вариантов шаблона с одинаковым campaign_id. Шаблон повторного
+    # сообщения (variant=templating.FOLLOWUP_VARIANT, см. app/followup.py) сюда не входит —
+    # иначе choose_template мог бы разослать его как обычное первое сообщение.
+    templates = [
+        t for t in client.list_templates()
+        if t.get("campaign_id") == str(campaign_id) and t.get("variant") != templating.FOLLOWUP_VARIANT
+    ]
     if templates:
         return templates
 

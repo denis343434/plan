@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     VK_HEADLESS: bool = True
     MIN_DELAY_SEC: float = 1.0
     MAX_DELAY_SEC: float = 3.0
+    # Сколько дней ждать ответа от лида (status=contacted, ни одного sent-сообщения с
+    # reply_status=replied) прежде чем послать ему повторное сообщение — см. app/followup.py.
+    FOLLOWUP_DELAY_DAYS: float = 3.0
     INBOX_CHECK_CONCURRENCY: int = 3
     # Раньше здесь был gate по ОБЩЕМУ бейджу непрочитанных в левом меню VK (#l_msg) — дважды
     # ловил ложное срабатывание вживую (не находил реальный ответ от "Кафе Миндаль"). Позже
@@ -38,6 +41,13 @@ class Settings(BaseSettings):
     # кампании из сотни лидов реально выталкивал рассылку за POLL_TIMEOUT_SEC оркестратора
     # (см. запрос пользователя 2026-08-25, "фаза: таймаут").
     VK_SITE_CHECK_TIMEOUT_MS: int = 500
+
+    IG_ADAPTER_MODE: str = "fake"  # fake | playwright
+    IG_HEADLESS: bool = True
+    # Instagram банит/чекпоинтит агрессивнее VK — держим более консервативные задержки по
+    # умолчанию, чем VK-аналог (MIN_DELAY_SEC/MAX_DELAY_SEC).
+    IG_MIN_DELAY_SEC: float = 3.0
+    IG_MAX_DELAY_SEC: float = 6.0
 
     LOG_LEVEL: str = "INFO"
 

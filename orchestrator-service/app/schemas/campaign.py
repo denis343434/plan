@@ -8,6 +8,7 @@ class CampaignCreate(BaseModel):
     platform: str
     keyword: str
     template_id: UUID | None = None
+    use_account: bool = True
 
 
 class CampaignStartResponse(BaseModel):

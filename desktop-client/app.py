@@ -33,10 +33,11 @@ DATA_URL = f"http://{HOST}:8001"
 PARSER_URL = f"http://{HOST}:8002"
 MESSAGING_URL = f"http://{HOST}:8003"
 
-# Скрипт живёт в parser-service (тот же, что используется и messaging-service) — реальный
-# вход в VK через настоящий Playwright-браузер, отдельно от этого приложения и его
+# Скрипты живут в parser-service (те же, что используются и messaging-service) — реальный
+# вход в VK/Instagram через настоящий Playwright-браузер, отдельно от этого приложения и его
 # stdlib-only зависимостей: требует `pip install playwright httpx` и `playwright install chromium`.
 VK_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "parser-service" / "scripts" / "vk_manual_login.py"
+IG_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "parser-service" / "scripts" / "instagram_manual_login.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ORCHESTRATOR_URL = f"http://{HOST}:8004"
 
@@ -92,7 +93,11 @@ RU_STATS_LABEL = {
 RU_DELIVERY_STATUS = {"sent": "отправлено", "failed": "ошибка", "pending": "сбой сети, повтор"}
 RU_REPLY_STATUS = {"none": "-", "replied": "есть ответ", "no_reply": "нет ответа"}
 RU_PURPOSE_REVERSE = {v: k for k, v in RU_PURPOSE.items()}
-PLATFORM_LABELS = {"vk": "VK", "telegram": "Telegram", "instagram": "Instagram"}
+# Ключи должны совпадать со значениями Platform в data-service/app/enums.py ("tg", не
+# "telegram") — иначе выбор в комбобоксе уходит на бэкенд строкой, не проходящей Pydantic-
+# валидацию (сама Instagram-запись этой проблемы не имела, ключ и значение платформы у неё и
+# так совпадают).
+PLATFORM_LABELS = {"vk": "VK", "tg": "Telegram", "instagram": "Instagram"}
 PLATFORM_REVERSE = {v: k for k, v in PLATFORM_LABELS.items()}
 
 
@@ -198,6 +203,10 @@ class App(tk.Tk):
         # _start_direct_send/_poll_retry_send — None, когда не запущена; не даёт запустить
         # вторую поверх идущей.
         self._retry_send_campaign_id: str | None = None
+        # campaign_id, для которой сейчас идёт отправка повторных сообщений тем, кто не ответил
+        # (см. on_send_followups/_poll_followup) — None, когда не запущена, не даёт запустить
+        # вторую поверх идущей (тот же приём, что и _retry_send_campaign_id).
+        self._followup_campaign_id: str | None = None
         # Очередь кампаний ("Запустить очередь") — снапшот выбранных id/имён на момент старта,
         # текущая позиция (-1 = очередь не идёт) и накопленные исходы для итоговой сводки.
         # _queue_generation растёт при каждом старте/стопе очереди и используется теми же
@@ -346,27 +355,31 @@ class App(tk.Tk):
 
         form = ttk.Frame(panel)
         form.pack(fill="x", pady=(0, 8))
-        self.acc_login = ttk.Entry(form, width=16)
+        self.acc_login = ttk.Entry(form, width=14)
         self.acc_login.grid(row=0, column=0, padx=2)
-        self.acc_purpose = ttk.Combobox(form, values=list(RU_PURPOSE.values()), width=14, state="readonly")
+        self.acc_platform = ttk.Combobox(form, values=list(PLATFORM_LABELS.values()), width=10, state="readonly")
+        self.acc_platform.set(PLATFORM_LABELS["vk"])
+        self.acc_platform.grid(row=0, column=1, padx=2)
+        self.acc_purpose = ttk.Combobox(form, values=list(RU_PURPOSE.values()), width=12, state="readonly")
         self.acc_purpose.set(RU_PURPOSE["both"])
-        self.acc_purpose.grid(row=0, column=1, padx=2)
+        self.acc_purpose.grid(row=0, column=2, padx=2)
         self.acc_hourly = ttk.Entry(form, width=6)
         self.acc_hourly.insert(0, "60")
-        self.acc_hourly.grid(row=0, column=2, padx=2)
+        self.acc_hourly.grid(row=0, column=3, padx=2)
         self.acc_daily = ttk.Entry(form, width=6)
         self.acc_daily.insert(0, "1000")
-        self.acc_daily.grid(row=0, column=3, padx=2)
-        ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_account).grid(row=0, column=4, padx=4)
+        self.acc_daily.grid(row=0, column=4, padx=2)
+        ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_account).grid(row=0, column=5, padx=4)
         self._placeholder(self.acc_login, "логин")
 
-        cols = ("login", "purpose", "status", "session", "usage", "cooldown")
+        cols = ("login", "platform", "purpose", "status", "session", "usage", "cooldown")
         self.acc_tree = ttk.Treeview(panel, columns=cols, show="headings", height=6)
         for col, title, width in (
-            ("login", "Логин", 130),
+            ("login", "Логин", 110),
+            ("platform", "Платформа", 80),
             ("purpose", "Назначение", 100),
             ("status", "Статус", 90),
-            ("session", "Вход в VK", 90),
+            ("session", "Сессия", 80),
             ("usage", "Нагрузка", 130),
             ("cooldown", "Кулдаун", 80),
         ):
@@ -381,6 +394,7 @@ class App(tk.Tk):
         acc_actions.pack(fill="x", pady=(6, 0))
         ttk.Button(acc_actions, text="Тестовая сессия для выбранного", command=self.on_set_session).pack(side="left")
         ttk.Button(acc_actions, text="Войти в VK", command=self.on_vk_login).pack(side="left", padx=(6, 0))
+        ttk.Button(acc_actions, text="Войти в Instagram", command=self.on_instagram_login).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Проверить сессии", command=self.on_check_sessions).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Остановить аккаунт", style="Danger.TButton", command=self.on_pause_account).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Продолжить", style="Success.TButton", command=self.on_resume_account).pack(side="left", padx=(6, 0))
@@ -401,11 +415,23 @@ class App(tk.Tk):
         self.camp_keyword = ttk.Entry(form, width=14)
         self.camp_keyword.grid(row=0, column=2, padx=2)
         self._placeholder(self.camp_keyword, "ключевое слово")
-        ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_campaign).grid(row=0, column=3, padx=4)
+        # По умолчанию включено — сохраняет прежнее единственное поведение (парсинг через
+        # сохранённую сессию аккаунта). Выключение — анонимный браузер без логина (см.
+        # parser-service/app/tasks.py::run_parse_task); для Instagram такая комбинация
+        # не поддерживается адаптером и кампания сразу завершится ошибкой.
+        self.camp_use_account = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="через аккаунт", variable=self.camp_use_account).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Создать", style="Accent.TButton", command=self.on_create_campaign).grid(row=0, column=4, padx=4)
 
-        cols = ("name", "keyword", "status")
+        cols = ("name", "platform", "keyword", "account", "status")
         self.camp_tree = ttk.Treeview(panel, columns=cols, show="headings", height=6, selectmode="extended")
-        for col, title, width in (("name", "Название", 150), ("keyword", "Ключевое слово", 140), ("status", "Статус", 110)):
+        for col, title, width in (
+            ("name", "Название", 130),
+            ("platform", "Платформа", 80),
+            ("keyword", "Ключевое слово", 130),
+            ("account", "Режим", 90),
+            ("status", "Статус", 110),
+        ):
             self.camp_tree.heading(col, text=title)
             self.camp_tree.column(col, width=width, anchor="w")
         self.camp_tree.pack(fill="both", expand=True)
@@ -446,6 +472,7 @@ class App(tk.Tk):
         ttk.Button(btns, text="Запустить", style="Accent.TButton", command=self.on_start_campaign).pack(side="left", padx=2)
         ttk.Button(btns, text="Запустить рассылку", command=self.on_start_new_leads_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Повторить с ошибками", command=self.on_retry_failed_send).pack(side="left", padx=2)
+        ttk.Button(btns, text="Отправить повторные", command=self.on_send_followups).pack(side="left", padx=2)
         ttk.Button(btns, text="Обновить", command=self.refresh_detail).pack(side="left", padx=2)
         ttk.Button(btns, text="Удалить кампанию", style="Danger.TButton", command=self.on_delete_campaign).pack(side="left", padx=2)
 
@@ -461,9 +488,14 @@ class App(tk.Tk):
         # чтобы не занимать место, пока кампания не запущена/не в процессе парсинга.
 
         ttk.Label(panel, text="ШАБЛОН СООБЩЕНИЯ", font=("Segoe UI", 9, "bold"), foreground="#777").pack(anchor="w")
+        ttk.Label(
+            panel,
+            text="Вариант F — повторное сообщение тем, кто не ответил 3 дня (кнопка «Отправить повторные»)",
+            foreground="#777",
+        ).pack(anchor="w", pady=(0, 2))
         tpl_form = ttk.Frame(panel)
         tpl_form.pack(fill="x", pady=(2, 4))
-        self.tpl_variant = ttk.Combobox(tpl_form, values=["A", "B"], width=4, state="readonly")
+        self.tpl_variant = ttk.Combobox(tpl_form, values=["A", "B", "F"], width=4, state="readonly")
         self.tpl_variant.set("A")
         self.tpl_variant.pack(side="left", padx=(0, 6))
         self.tpl_body = ttk.Entry(tpl_form)
@@ -613,7 +645,8 @@ class App(tk.Tk):
                 self.acc_tree.insert(
                     "", "end", iid=a["id"],
                     values=(
-                        a["login"], RU_PURPOSE.get(a["purpose"], a["purpose"]),
+                        a["login"], PLATFORM_LABELS.get(a["platform"], a["platform"]),
+                        RU_PURPOSE.get(a["purpose"], a["purpose"]),
                         RU_ACCOUNT_STATUS.get(a["status"], a["status"]), session_text, usage,
                         self._cooldown_text(a),
                     ),
@@ -636,7 +669,7 @@ class App(tk.Tk):
 
     def on_create_account(self) -> None:
         payload = {
-            "platform": "vk",
+            "platform": PLATFORM_REVERSE.get(self.acc_platform.get(), "vk"),
             "login": self._value(self.acc_login),
             "purpose": RU_PURPOSE_REVERSE.get(self.acc_purpose.get(), "both"),
             "hourly_limit": int(self._value(self.acc_hourly) or 60),
@@ -778,11 +811,41 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Вход в VK", f"Не удалось запустить скрипт логина: {exc}")
 
+    def on_instagram_login(self) -> None:
+        # Дублирует on_vk_login с точностью до текста и скрипта — та же осознанная мелкая
+        # дупликация, что и у instagram_manual_login.py относительно vk_manual_login.py.
+        selected = self.acc_tree.selection()
+        if not selected:
+            messagebox.showinfo("Вход в Instagram", "Сначала выберите аккаунт в таблице")
+            return
+        account_id = selected[0]
+        if not IG_LOGIN_SCRIPT.exists():
+            messagebox.showerror("Вход в Instagram", f"Не найден скрипт: {IG_LOGIN_SCRIPT}")
+            return
+
+        if not messagebox.askyesno(
+            "Вход в Instagram",
+            "Откроется отдельное окно браузера — войди в Instagram вручную (с 2FA/чекпоинтом, "
+            "если есть), затем вернись в открывшуюся консоль и нажми Enter, чтобы сохранить сессию.\n\n"
+            "Продолжить?",
+        ):
+            return
+
+        try:
+            subprocess.Popen(
+                [sys.executable, str(IG_LOGIN_SCRIPT), "--account-id", account_id, "--data-service-url", DATA_URL],
+                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+                cwd=str(IG_LOGIN_SCRIPT.parent.parent),
+            )
+            self.flash_status("Окно логина Instagram открывается в отдельной консоли…")
+        except OSError as exc:
+            messagebox.showerror("Вход в Instagram", f"Не удалось запустить скрипт логина: {exc}")
+
     def _set_session_cell(self, account_id: str, text: str, tag: str) -> None:
         if not self.acc_tree.exists(account_id):
             return
         values = list(self.acc_tree.item(account_id, "values"))
-        values[3] = text  # колонка "session" — см. cols в _build_accounts_panel
+        values[4] = text  # колонка "session" — см. cols в _build_accounts_panel (сдвинулась после добавления "platform")
         self.acc_tree.item(account_id, values=values, tags=(tag,))
 
     def on_check_sessions(self) -> None:
@@ -805,9 +868,12 @@ class App(tk.Tk):
 
         for a in targets:
             account_id = a["id"]
+            platform = a.get("platform", "vk")
 
-            def fetch(account_id=account_id):
-                return api_request(PARSER_URL, f"/accounts/{account_id}/session-check", timeout=25.0)
+            def fetch(account_id=account_id, platform=platform):
+                return api_request(
+                    PARSER_URL, f"/accounts/{account_id}/session-check?platform={platform}", timeout=25.0
+                )
 
             def done(result, account_id=account_id):
                 valid = bool(result and result.get("valid"))
@@ -839,7 +905,11 @@ class App(tk.Tk):
             for c in campaigns:
                 self.camp_tree.insert(
                     "", "end", iid=c["id"],
-                    values=(c["name"], c["keyword"], RU_CAMPAIGN_STATUS.get(c["status"], c["status"])),
+                    values=(
+                        c["name"], PLATFORM_LABELS.get(c["platform"], c["platform"]), c["keyword"],
+                        "в аккаунте" if c.get("use_account", True) else "без аккаунта",
+                        RU_CAMPAIGN_STATUS.get(c["status"], c["status"]),
+                    ),
                 )
             # Восстанавливаем мультивыбор (см. очередь, on_start_queue) — иначе периодический
             # тик (REFRESH_LIST_MS) сбрасывал бы ctrl-click выбор ещё до того, как пользователь
@@ -860,6 +930,7 @@ class App(tk.Tk):
             "name": self._value(self.camp_name),
             "platform": PLATFORM_REVERSE.get(self.camp_platform.get(), "vk"),
             "keyword": self._value(self.camp_keyword),
+            "use_account": self.camp_use_account.get(),
         }
         if not payload["name"] or not payload["keyword"]:
             messagebox.showwarning("Кампании", "Заполните название и ключевое слово")
@@ -1191,6 +1262,83 @@ class App(tk.Tk):
 
         self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="retry_send_status")
 
+    def on_send_followups(self) -> None:
+        if not self.selected_campaign_id:
+            return
+        campaign_id = self.selected_campaign_id
+        if self._followup_campaign_id is not None:
+            messagebox.showinfo("Повторные сообщения", "Отправка повторных уже идёт, дождитесь её окончания")
+            return
+
+        self._followup_campaign_id = campaign_id
+        self.detail_progress_bar.pack_forget()
+        self.detail_progress_label.configure(text="ищу неответивших…")
+
+        def start():
+            # Шлёт ровно ОДНО повторное сообщение (шаблон variant="F") лидам со status=contacted,
+            # у которых последнее успешно отправленное сообщение старше FOLLOWUP_DELAY_DAYS
+            # (по умолчанию 3 дня) и ответа так и не было — см. messaging-service/app/followup.py.
+            # Лид, уже получивший повтор, и лид, ответивший (status=replied — проверяется
+            # обычной кнопкой "Проверить ответы"), повторно не трогаются.
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/followup", method="POST")
+
+        def started(_result):
+            self.after(500, lambda: self._poll_followup(campaign_id))
+
+        def error(exc):
+            self._followup_campaign_id = None
+            self.detail_progress_label.configure(text="")
+            messagebox.showerror("Повторные сообщения", str(exc))
+
+        self.run_bg(start, on_done=started, on_error=error)
+
+    def _poll_followup(self, campaign_id: str) -> None:
+        if campaign_id != self.selected_campaign_id:
+            self._followup_campaign_id = None
+            return
+
+        def fetch():
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/followup-status", timeout=15.0)
+
+        def done(result):
+            if campaign_id != self.selected_campaign_id:
+                self._followup_campaign_id = None
+                return
+            status = result["status"]
+            if status in ("queued", "running"):
+                self.detail_progress_label.configure(
+                    text=f"Повторные: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+                )
+                self.after(2000, lambda: self._poll_followup(campaign_id))
+                return
+
+            self._followup_campaign_id = None
+            if status == "failed":
+                self.detail_progress_label.configure(text="")
+                messagebox.showerror("Повторные сообщения", result.get("error") or "не удалось отправить повторные")
+                return
+            if status == "waiting_for_account":
+                self.detail_progress_label.configure(
+                    text=f"Повторные приостановлены: нет свободного аккаунта "
+                    f"(отправлено {result['sent']}, ошибок {result['failed']})"
+                )
+                self.flash_status("Повторные приостановлены: нет свободного аккаунта")
+                self.refresh_leads()
+                return
+
+            self.detail_progress_label.configure(
+                text=f"Повторные отправлены: отправлено {result['sent']}, ошибок {result['failed']}, пропущено {result['skipped']}"
+            )
+            self.flash_status(f"Повторные: отправлено {result['sent']}, ошибок {result['failed']}")
+            self.refresh_leads()
+
+        def error(exc):
+            self._followup_campaign_id = None
+            self.detail_progress_label.configure(text="")
+            messagebox.showerror("Повторные сообщения", str(exc))
+
+        self.run_bg(fetch, on_done=done, on_error=error, dedupe_key="followup_status")
+
     def refresh_detail(self) -> None:
         if not self.selected_campaign_id:
             return
@@ -1210,10 +1358,11 @@ class App(tk.Tk):
             elif data.get("note"):
                 status_text += f" · {data['note']}"
             self.detail_status.configure(text=status_text, foreground="#c0392b" if data.get("error") else "#555")
-            if self._retry_send_campaign_id != campaign_id:
-                # Пока идёт своя повторная рассылка (см. _poll_retry_send) — Orchestrator о ней
-                # не знает (её запускают напрямую в Messaging Service в обход него) и покажет
-                # тут устаревший/пустой прогресс, затирая наш. Не даём ему это делать.
+            if self._retry_send_campaign_id != campaign_id and self._followup_campaign_id != campaign_id:
+                # Пока идёт своя повторная рассылка (см. _poll_retry_send) или отправка повторных
+                # неответившим (см. _poll_followup) — Orchestrator о них не знает (запускаются
+                # напрямую в Messaging Service в обход него) и покажет тут устаревший/пустой
+                # прогресс, затирая наш. Не даём ему это делать.
                 self._update_progress(data.get("phase"), data.get("progress"))
 
         def error(exc):

@@ -39,8 +39,9 @@ class ParserServiceClient:
         keyword: str,
         campaign_id: UUID | str | None = None,
         filters: dict | None = None,
+        use_account: bool = True,
     ) -> dict:
-        body = {"platform": platform, "keyword": keyword, "filters": filters or {}}
+        body = {"platform": platform, "keyword": keyword, "filters": filters or {}, "use_account": use_account}
         if campaign_id is not None:
             body["campaign_id"] = str(campaign_id)
         return self._request("POST", "/parse", json=body).json()

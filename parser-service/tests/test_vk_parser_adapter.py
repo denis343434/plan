@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from app.adapters.base import CaptchaDetectedError
+from app.adapters.base import CaptchaDetectedError, ParseFilters
 from app.adapters.vk import (
     _COMMUNITIES_SECTION_LABEL,
     _SEARCH_INPUT_SELECTOR,
@@ -186,6 +186,64 @@ def test_has_external_site_none_when_site_field_check_fails_unexpectedly():
 
     adapter = VkParserAdapter(storage_state={})
     assert adapter._has_external_site(page, "https://vk.com/group") is None
+
+
+def _make_anon_link(href: str, text: str = "Some Group"):
+    link = MagicMock()
+    link.get_attribute.return_value = href
+    link.inner_text.return_value = text
+    return link
+
+
+def test_parse_anon_link_extracts_group_from_relative_and_absolute_href():
+    adapter = VkParserAdapter(storage_state={})
+
+    lead = adapter._parse_anon_link(_make_anon_link("/fitness_club1"))
+    assert lead is not None
+    assert lead.external_id == "fitness_club1"
+    assert lead.group_url == "https://vk.com/fitness_club1"
+
+    lead2 = adapter._parse_anon_link(_make_anon_link("https://vk.com/club12345?ref=search", text="Club"))
+    assert lead2 is not None
+    assert lead2.external_id == "club12345"
+
+
+def test_parse_anon_link_filters_system_and_unrelated_links():
+    adapter = VkParserAdapter(storage_state={})
+
+    assert adapter._parse_anon_link(_make_anon_link("/search")) is None
+    assert adapter._parse_anon_link(_make_anon_link("/settings")) is None
+    assert adapter._parse_anon_link(_make_anon_link("https://vk.com/away.php?to=example.com")) is None
+    assert adapter._parse_anon_link(_make_anon_link("javascript:void(0)")) is None
+
+
+def test_search_communities_anonymous_collects_and_dedupes_candidates():
+    page = MagicMock()
+    page.goto.return_value = None
+    page.query_selector.return_value = None  # капча-селектор отсутствует
+    page.query_selector_all.return_value = [
+        _make_anon_link("/groupone", "Group One"),
+        _make_anon_link("/groupone", "Group One"),  # дубль ссылки на ту же группу
+        _make_anon_link("/known_group", "Known"),
+        _make_anon_link("/search"),  # системная ссылка
+    ]
+
+    adapter = VkParserAdapter(storage_state={})
+    filters = ParseFilters(known_external_ids=frozenset({"known_group"}))
+    candidates = adapter._search_communities_anonymous(page, "fitness", filters, [])
+
+    assert [c.external_id for c in candidates] == ["groupone"]
+
+
+def test_search_communities_anonymous_raises_on_captcha():
+    page = MagicMock()
+    page.goto.return_value = None
+    page.query_selector.return_value = MagicMock()  # капча-селектор найден
+    page.query_selector_all.return_value = []
+
+    adapter = VkParserAdapter(storage_state={})
+    with pytest.raises(CaptchaDetectedError):
+        adapter._search_communities_anonymous(page, "fitness", ParseFilters(), [])
 
 
 def test_open_communities_search_raises_session_expired_when_login_required():

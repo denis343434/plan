@@ -1,4 +1,5 @@
 from app.adapters.base import SourceAdapter
+from app.adapters.instagram_fake import FakeInstagramAdapter
 from app.adapters.stub import NotImplementedAdapter
 from app.adapters.vk_fake import FakeVkAdapter
 from app.config import settings
@@ -11,4 +12,10 @@ def get_adapter(platform: str, storage_state: dict | None = None) -> SourceAdapt
 
             return VkParserAdapter(storage_state or {})
         return FakeVkAdapter()
+    if platform == "instagram":
+        if settings.IG_ADAPTER_MODE == "playwright":
+            from app.adapters.instagram import InstagramParserAdapter  # lazy: same reason as VK above
+
+            return InstagramParserAdapter(storage_state or {})
+        return FakeInstagramAdapter()
     return NotImplementedAdapter(platform)

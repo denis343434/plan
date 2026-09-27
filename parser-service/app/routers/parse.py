@@ -18,6 +18,7 @@ def start_parse(request: ParseRequest, background_tasks: BackgroundTasks) -> Par
         request.keyword,
         request.filters,
         request.campaign_id,
+        request.use_account,
     )
     return ParseTaskOut(task_id=task.task_id, status=task.status)
 

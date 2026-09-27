@@ -73,6 +73,8 @@ def run_campaign_flow(campaign_id: uuid.UUID, max_groups: int | None = None) -> 
             keyword=campaign["keyword"],
             campaign_id=campaign_id,
             filters={"max_groups": max_groups} if max_groups is not None else None,
+            # По умолчанию True — для кампаний, созданных до появления этого поля в Data Service.
+            use_account=campaign.get("use_account", True),
         )
         outcome, last_status = _poll(
             fetch_status=lambda: parser_client.get_parse_status(parse_task["task_id"]),
