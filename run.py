@@ -101,8 +101,15 @@ def _start_local_services() -> None:
             subprocess.Popen(
                 [str(_python_for(service)), "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", str(port)],
                 cwd=ROOT / service,
+                stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                # Своя (скрытая) консоль, а не унаследованная от run.py: после выхода run.py /
+                # закрытия его терминала драйвер Playwright (node.exe), который сервис запускает
+                # позже, падал сразу при старте — "Connection closed while reading from the
+                # driver" → "'PlaywrightContextManager' object has no attribute '_playwright'"
+                # (поймано вживую 2026-10-03 на парсинге и проверке сессий).
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
     for service, port in LOCAL_SERVICES.items():
         if not _wait_for(port):

@@ -12,6 +12,7 @@ class CampaignCreate(BaseModel):
     keyword: str
     template_id: UUID | None = None
     use_account: bool = True
+    parse_params: dict | None = None
 
 
 class CampaignUpdate(BaseModel):
@@ -19,6 +20,7 @@ class CampaignUpdate(BaseModel):
     status: CampaignStatus | None = None
     template_id: UUID | None = None
     use_account: bool | None = None
+    parse_params: dict | None = None
 
 
 class CampaignOut(BaseModel):
@@ -30,5 +32,6 @@ class CampaignOut(BaseModel):
     keyword: str
     template_id: UUID | None
     use_account: bool
+    parse_params: dict | None = None
     status: CampaignStatus
     created_at: datetime

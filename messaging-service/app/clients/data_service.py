@@ -83,6 +83,11 @@ class DataServiceClient:
     def get_session(self, account_id: str) -> dict:
         return self._request("GET", f"/accounts/{account_id}/session").json()
 
+    def put_session(self, account_id: str, storage_state: dict) -> dict:
+        return self._request(
+            "PUT", f"/accounts/{account_id}/session", json={"storage_state": storage_state}
+        ).json()
+
     def release_account(self, account_id: str) -> dict:
         return self._request("POST", f"/accounts/{account_id}/release").json()
 

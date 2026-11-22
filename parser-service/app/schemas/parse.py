@@ -6,6 +6,13 @@ from pydantic import BaseModel
 class ParseFiltersSchema(BaseModel):
     has_site: bool | None = None
     max_groups: int | None = None
+    # yandex_maps — см. ParseFilters в adapters/base.py.
+    city: str | None = None
+    channels: list[str] | None = None
+    whatsapp_by_phone: bool = False
+    search_socials: bool = False
+    # Устаревшее имя search_socials (кампании, созданные до 2026-10-04) — читается как оно.
+    tg_by_phone: bool = False
 
 
 class ParseRequest(BaseModel):

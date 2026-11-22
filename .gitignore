@@ -7,3 +7,7 @@ __pycache__/
 .mypy_cache/
 .claude/
 backups/
+.scratch/
+*.log
+*.log.prev
+*.bak

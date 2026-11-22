@@ -9,7 +9,10 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import ElementHandle, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from app import ratelimit
 from app.adapters.base import ReplyCheckResult, SendResult, SessionExpiredError
+from app.adapters.browser_session import PersistentBrowserMixin
+from app.adapters.proxy import parse_proxy_url
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,7 +32,12 @@ _SLOW_RENDER_TIMEOUT_MS = 40_000
 # Рабочий путь — как у живого пользователя: зайти на страницу сообщества и взять href из
 # кнопки "Написать сообщение" (data-testid="group_action_send_message") — в нём уже
 # зашит настоящий числовой ID (/im/convo/-<id>...), резолвить screen_name самим не нужно.
-_SEND_MESSAGE_BUTTON_SELECTOR = '[data-testid="group_action_send_message"]'
+_SEND_MESSAGE_BUTTON_SELECTOR = (
+    'a[href*="/im/convo/"], [data-testid="group_action_send_message"]'
+)
+# VK (редизайн, ноябрь 2026) убрал data-testid: кнопка "Написать сообщение" теперь иконка-ссылка
+# прямо на переписку с сообществом (/im/convo/-<id>), с aria-label "Написать сообщение". Старый
+# селектор оставлен вторым — на случай отката/АБ-теста.
 
 # Поле "официальный сайт сообщества" в шапке группы — тот же селектор и тот же принцип валидации
 # (доменоподобная строка, не просто "поле непустое"), что и в parser-service/app/adapters/vk.py::
@@ -38,6 +46,47 @@ _SEND_MESSAGE_BUTTON_SELECTOR = '[data-testid="group_action_send_message"]'
 # ловит такие случаи здесь же, вместо того чтобы молча писать в сообщество с собственным сайтом.
 _SITE_FIELD_SELECTOR = '[data-testid="group-info-site"]'
 _SITE_DOMAIN_PATTERN = re.compile(r"[a-zа-яё0-9][a-zа-яё0-9-]*\.[a-zа-яё]{2,}", re.IGNORECASE)
+
+# Сайт сообщества после редизайна VK — ссылка-адрес в блоке контактов с иконкой глобуса
+# (svg.vkuiIcon--globe_outline_20), плюс (запасной путь) адрес в описании сообщества. Признак по
+# иконке не зависит от вёрстки/колонки, поэтому группы с сайтом больше не проскакивают.
+_SITE_CHECK_JS = """
+() => {
+  const ignoreHost = /(^|\\.)(vk\\.(com|ru|me|link|cc)|userapi\\.com|vk\\.company|vk\\.wiki|t\\.me|telegram\\.me|wa\\.me|whatsapp\\.com|max\\.ru|ok\\.ru|instagram\\.com|facebook\\.com|youtube\\.com|youtu\\.be|dzen\\.ru|rutube\\.ru)$/i;
+  const urlLike = /^(https?:\\/\\/)?[a-zа-яё0-9][a-zа-яё0-9.-]*\\.[a-zа-яё]{2,}(\\/.*)?$/i;
+  // Известные TLD, включая punycode для кириллических доменов (.рф/.москва/.рус/.бел/...): VK
+  // отдаёт такие адреса уже в punycode. Нужен только для описания — чтобы не спутать адрес
+  // ("ул.Университетская", который VK тоже превращает в ссылку) с настоящим сайтом.
+  const okTld = /^(xn--p1ai|xn--80adxhks|xn--p1acf|xn--90ais|ru|com|net|org|su|io|pro|shop|store|site|online|biz|info|me|club|tech|studio|digital|agency|center|group|company|design|art|space|xyz|top|moscow)$/i;
+  const found = [];
+  const push = (href, strict) => {
+    let target = href || '';
+    const m = target.match(/away\\.php\\?to=([^&]+)/);
+    if (m) { try { target = decodeURIComponent(m[1]); } catch (e) {} }
+    // Instagram в любом виде (instagram.com, www./l.instagram.com, instagr.am, ссылка вида
+    // ".../instagram") — не собственный сайт сообщества: такую группу пишем как "без сайта".
+    if (/instagram/i.test(target) || /instagr\\.am/i.test(target)) return;
+    let host = '';
+    try { host = new URL(target, 'https://vk.com').hostname; } catch (e) { host = ''; }
+    if (!host || ignoreHost.test(host)) return;
+    if (strict) {
+      const tld = host.split('.').pop() || '';
+      if (!okTld.test(tld)) return;
+    }
+    if (!found.includes(host)) found.push(host);
+  };
+  // 1) Строка "сайт" в контактах: ссылка с иконкой глобуса — так VK рисует именно сайт. Здесь
+  //    доверяем самой иконке: домен может быть кириллическим (punycode) — это всё равно сайт.
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (a.querySelector('svg[class*="globe"]')) push(a.getAttribute('href'), false);
+  }
+  // 2) Сайт, указанный в описании сообщества (VK показывает его там, если поле контактов пустое).
+  for (const a of document.querySelectorAll('[elementtiming*="community_description"] a[href]')) {
+    if (urlLike.test((a.innerText || '').trim())) push(a.getAttribute('href'), true);
+  }
+  return found;
+}
+"""
 
 # Селекторы проверены вживую 2026-08-20 через реальный залогиненный аккаунт (см. также
 # parser-service/app/adapters/vk.py — тот же VKUI, тот же принцип подбора).
@@ -169,6 +218,22 @@ def _block_heavy_resources(context) -> None:
     context.route("**/*", handler)
 
 
+def _proxy_settings() -> dict | None:
+    """settings.VK_PROXY ("http://login:pass@host:port") → proxy-аргумент chromium.launch.
+    Логин/пароль Playwright принимает только отдельными полями, не внутри server-URL."""
+    return parse_proxy_url(settings.VK_PROXY, "VK_PROXY")
+
+
+def _launch_browser(pw):
+    """Все VK-браузеры messaging-service (рассылка, follow-up, ответы, проверка входящих) идут
+    через один и тот же прокси — у аккаунта не должен прыгать IP между отправкой и чтением."""
+    proxy = _proxy_settings()
+    if proxy is None:
+        return pw.chromium.launch(headless=settings.VK_HEADLESS)
+    logger.info("launching VK browser via proxy %s", proxy["server"])
+    return pw.chromium.launch(headless=settings.VK_HEADLESS, proxy=proxy)
+
+
 def _sleep_random() -> None:
     time.sleep(random.uniform(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC))
 
@@ -189,132 +254,188 @@ def _goto_or_raise(page: Page, url: str) -> None:
         raise _PageLoadError(str(exc)) from exc
 
 
-class VkSendAdapter:
+class VkSendAdapter(PersistentBrowserMixin):
+    # Выставляется в _pass_challenge_if_visible после ручного прохождения антибот-проверки;
+    # tasks.py по этому флагу сохраняет обновлённую сессию (cookies) в Data Service.
+    challenge_passed = False
+
     def __init__(self, storage_state: dict) -> None:
         self._storage_state = storage_state
 
-    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
+    def _playwright_factory(self):
+        return sync_playwright()
+
+    def _launch(self, pw):
+        browser = _launch_browser(pw)
+        try:
             context = browser.new_context(storage_state=self._storage_state or None)
             _block_heavy_resources(context)
-            page = context.new_page()
+        except BaseException:
+            browser.close()
+            raise
+        return browser, context
+
+    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
+        return self._with_page(lambda page: self._send_on_page(page, lead, text, image))
+
+    def _send_on_page(self, page: Page, lead: dict, text: str, image: dict | None) -> SendResult:
+        try:
+            # wait_until="load" (дефолт) у VK почти всегда упирается в таймаут — страница
+            # держит вебсокет для реалтайм-чата, из-за которого "load" может не наступить
+            # вовсе, хотя сам контент уже отрисован. "domcontentloaded" + явные ожидания
+            # конкретных элементов — надёжнее.
+            _goto_or_raise(page, lead["group_url"])
+            self._pass_challenge_if_visible(page)
+            if self._is_challenge(page):
+                return SendResult(
+                    success=False,
+                    blocked=True,
+                    error="VK показывает антибот-проверку «Проверяем, что вы не робот» — "
+                    "включите видимый браузер (VK_HEADLESS=false) и нажмите «Продолжить» вручную",
+                )
+
             try:
-                # wait_until="load" (дефолт) у VK почти всегда упирается в таймаут — страница
-                # держит вебсокет для реалтайм-чата, из-за которого "load" может не наступить
-                # вовсе, хотя сам контент уже отрисован. "domcontentloaded" + явные ожидания
-                # конкретных элементов — надёжнее.
-                _goto_or_raise(page, lead["group_url"])
-
-                try:
-                    send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    # Проверяем ПОСЛЕ таймаута, а не сразу после goto — сразу после goto экран
-                    # повторного входа (если он есть) мог ещё не отрисоваться (та же задержка
-                    # VK, что и у обычного контента), instant-проверка тогда всегда мимо (см.
-                    # запрос пользователя 2026-08-24 — первая версия этой проверки ничего не
-                    # находила). Если это он — SessionExpiredError пробрасывается отсюда же.
-                    _raise_if_login_required(page)
-                    # Не проблема аккаунта/кода — либо сообщество отключило приём сообщений
-                    # от посторонних (кнопки физически нет), либо VK не успел её отрисовать
-                    # за _SLOW_RENDER_TIMEOUT_MS. В обоих случаях это лид-специфичная неудача,
-                    # не флуд/бан аккаунта.
+                send_btn = page.wait_for_selector(_SEND_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                # Проверяем ПОСЛЕ таймаута, а не сразу после goto — сразу после goto экран
+                # повторного входа (если он есть) мог ещё не отрисоваться (та же задержка
+                # VK, что и у обычного контента), instant-проверка тогда всегда мимо (см.
+                # запрос пользователя 2026-08-24 — первая версия этой проверки ничего не
+                # находила). Если это он — SessionExpiredError пробрасывается отсюда же.
+                _raise_if_login_required(page)
+                if self._is_challenge(page):
                     return SendResult(
                         success=False,
-                        error="у сообщества недоступна кнопка «Написать сообщение» — либо приём сообщений отключён, либо страница не успела прогрузиться",
+                        blocked=True,
+                        error="VK показывает антибот-проверку «Проверяем, что вы не робот» — "
+                        "включите видимый браузер (VK_HEADLESS=false) и нажмите «Продолжить» вручную",
                     )
+                # Не проблема аккаунта/кода — либо сообщество отключило приём сообщений
+                # от посторонних (кнопки физически нет), либо VK не успел её отрисовать
+                # за _SLOW_RENDER_TIMEOUT_MS. В обоих случаях это лид-специфичная неудача,
+                # не флуд/бан аккаунта.
+                return SendResult(
+                    success=False,
+                    error="у сообщества недоступна кнопка «Написать сообщение» — либо приём сообщений отключён, либо страница не успела прогрузиться",
+                    unreachable=True,
+                )
 
-                # Проверяем сайт ЗДЕСЬ, а не сразу после goto — страница уже доказанно
-                # прогрузилась (кнопка выше только что нашлась), так что _has_external_site не
-                # нужен отдельный многосекундный wait_for_selector "с нуля" на каждый лид: раньше
-                # (проверка сразу после goto) это добавляло полный VK_SITE_CHECK_TIMEOUT_MS К
-                # КАЖДОМУ сообществу БЕЗ сайта (то есть почти к каждому — парсер и так должен
-                # отсеивать сайты, эта проверка тут только на случай его ошибки) и реально
-                # выталкивало кампанию за POLL_TIMEOUT_SEC оркестратора на полусотне+ лидов (см.
-                # запрос пользователя 2026-08-25, скриншот "фаза: таймаут"). Блок "сайт сообщества"
-                # в шапке — статическая информация, отрисовывается вместе с остальной шапкой (той
-                # же, что содержит саму кнопку "Написать сообщение"), не отдельным async-виджетом.
-                if self._has_external_site(page) is True:
+            # Проверяем сайт ЗДЕСЬ, а не сразу после goto — страница уже доказанно
+            # прогрузилась (кнопка выше только что нашлась), так что _has_external_site не
+            # нужен отдельный многосекундный wait_for_selector "с нуля" на каждый лид: раньше
+            # (проверка сразу после goto) это добавляло полный VK_SITE_CHECK_TIMEOUT_MS К
+            # КАЖДОМУ сообществу БЕЗ сайта (то есть почти к каждому — парсер и так должен
+            # отсеивать сайты, эта проверка тут только на случай его ошибки) и реально
+            # выталкивало кампанию за POLL_TIMEOUT_SEC оркестратора на полусотне+ лидов (см.
+            # запрос пользователя 2026-08-25, скриншот "фаза: таймаут"). Блок "сайт сообщества"
+            # в шапке — статическая информация, отрисовывается вместе с остальной шапкой (той
+            # же, что содержит саму кнопку "Написать сообщение"), не отдельным async-виджетом.
+            if not lead.get("skip_site_check") and self._has_external_site(page) is True:
+                return SendResult(
+                    success=False,
+                    error="у сообщества указан собственный сайт — рассылка пропущена (похоже, ошибка парсера)",
+                    has_site=True,
+                    unreachable=True,
+                )
+
+            chat_href = send_btn.get_attribute("href")
+            _goto_or_raise(page, urljoin(page.url, chat_href))
+            ratelimit.settle()
+
+            flood = self._detect_flood(page)
+            if flood is not None:
+                return SendResult(success=False, error=flood, flood_detected=True)
+
+            try:
+                page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return SendResult(
+                    success=False,
+                    error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер VK)",
+                )
+            if image is not None:
+                if not self._attach_image(page, image):
                     return SendResult(
                         success=False,
-                        error="у сообщества указан собственный сайт — рассылка пропущена (похоже, ошибка парсера)",
-                        has_site=True,
+                        error="не удалось прикрепить изображение — не найден элемент загрузки файла "
+                        "в редакторе сообщения (селекторы не подтверждены вживую, см. комментарий "
+                        "у _ATTACH_BUTTON_SELECTOR)",
                     )
 
-                chat_href = send_btn.get_attribute("href")
-                _goto_or_raise(page, urljoin(page.url, chat_href))
-                _sleep_random()
+            page.click(_MESSAGE_INPUT_SELECTOR)
+            ratelimit.settle()
+            self._type_like_human(page, text)
 
-                flood = self._detect_flood(page)
-                if flood is not None:
-                    return SendResult(success=False, error=flood, flood_detected=True)
+            page.click(_SEND_BUTTON_SELECTOR)
+            ratelimit.settle()
 
-                try:
-                    page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    return SendResult(
-                        success=False,
-                        error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер VK)",
-                    )
-                if image is not None:
-                    if not self._attach_image(page, image):
-                        return SendResult(
-                            success=False,
-                            error="не удалось прикрепить изображение — не найден элемент загрузки файла "
-                            "в редакторе сообщения (селекторы не подтверждены вживую, см. комментарий "
-                            "у _ATTACH_BUTTON_SELECTOR)",
-                        )
+            flood = self._detect_flood(page)
+            if flood is not None:
+                return SendResult(success=False, error=flood, flood_detected=True)
 
-                page.click(_MESSAGE_INPUT_SELECTOR)
-                _sleep_random()
-                self._type_like_human(page, text)
-
-                page.click(_SEND_BUTTON_SELECTOR)
-                _sleep_random()
-
-                flood = self._detect_flood(page)
-                if flood is not None:
-                    return SendResult(success=False, error=flood, flood_detected=True)
-
-                return SendResult(success=True)
-            except _PageLoadError as exc:
-                logger.warning("failed to load VK page for lead %s, will retry: %s", lead.get("id"), exc)
-                return SendResult(success=False, error=str(exc), network_error=True)
-            except SessionExpiredError as exc:
-                # Как и flood_detected — сигнал "проблема в АККАУНТЕ, не в этом лиде": вызывающий
-                # код (tasks.py/reply.py) должен отправить аккаунт в cooldown вместо того, чтобы
-                # снова брать его на следующий лид и упираться в тот же экран входа.
-                return SendResult(success=False, error=str(exc), session_expired=True)
-            except Exception as exc:  # unexpected Playwright/DOM failure — reported as a delivery failure
-                logger.exception("vk send failed for lead %s", lead.get("id"))
-                return SendResult(success=False, error=str(exc))
-            finally:
-                context.close()
-                browser.close()
+            return SendResult(success=True)
+        except _PageLoadError as exc:
+            logger.warning("failed to load VK page for lead %s, will retry: %s", lead.get("id"), exc)
+            return SendResult(success=False, error=str(exc), network_error=True)
+        except SessionExpiredError as exc:
+            # Как и flood_detected — сигнал "проблема в АККАУНТЕ, не в этом лиде": вызывающий
+            # код (tasks.py/reply.py) должен отправить аккаунт в cooldown вместо того, чтобы
+            # снова брать его на следующий лид и упираться в тот же экран входа.
+            return SendResult(success=False, error=str(exc), session_expired=True)
+        except Exception as exc:  # unexpected Playwright/DOM failure — reported as a delivery failure
+            logger.exception("vk send failed for lead %s", lead.get("id"))
+            # Браузер закрыли руками / он упал посреди отправки — это транзиентный сбой, а не
+            # проблема лида: помечаем как network_error (delivery_status="pending"), чтобы лид
+            # не "сгорел" навсегда и подхватился следующим запуском, а рассылка шла дальше.
+            dead = any(s in str(exc) for s in ("has been closed", "Target closed", "Connection closed"))
+            return SendResult(success=False, error=str(exc), network_error=dead)
 
     def _has_external_site(self, page: Page) -> bool | None:
         """Вызывается ПОСЛЕ того, как на этой же странице группы уже нашлась кнопка "Написать
-        сообщение" (см. send_message) — страница гарантированно прогружена, второй goto не нужен
-        (в отличие от parser-service::_has_external_site, которому ещё только предстоит перейти
-        на страницу кандидата "с нуля"). Поэтому таймаут здесь короткий (VK_SITE_CHECK_TIMEOUT_MS)
-        — не полноценное ожидание рендера, а небольшая подстраховка на случай, если блок с сайтом
-        отрисовывается чуть позже остальной шапки группы. True/False — однозначный результат,
-        None — не удалось определить (неожиданная ошибка); вызывающий код в этом случае не
-        блокирует отправку — see send_message."""
+        сообщение" (см. send_message) — страница гарантированно прогружена, отдельного ожидания
+        не нужно. True/False — однозначный результат, None — не удалось определить (неожиданная
+        ошибка); вызывающий код в этом случае не блокирует отправку — see send_message.
+
+        VK убрал [data-testid="group-info-site"]: сайт теперь просто строка в блоке контактов
+        (ссылка с адресом сайта в тексте). Ищем её структурно — см. _SITE_CHECK_JS; ссылки
+        vk.link/vk.me/vk.ru сайтом не считаем, это короткие ссылки самого сообщества."""
         try:
-            page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            # Проверяем ПОСЛЕ таймаута, а не сразу — тот же приём, что и у остальных проверок в
-            # этом файле (экран повторного входа сам ещё мог не отрисоваться сразу после goto).
-            _raise_if_login_required(page)
-            return False  # страница загрузилась, поля просто нет — сайта нет
+            return bool(page.evaluate(_SITE_CHECK_JS))
         except Exception:
             logger.warning("failed to check site presence for %s, proceeding with send", page.url, exc_info=True)
             return None
-        el = page.query_selector(_SITE_FIELD_SELECTOR)
-        if el is None:
+
+    def _is_challenge(self, page: Page) -> bool:
+        url = page.url
+        if isinstance(url, str) and "challenge.html" in url:
+            return True
+        try:
+            return "проверяем, что вы не робот" in page.inner_text("body").lower()
+        except Exception:  # noqa: BLE001 - в юнит-тестах/на закрытой странице просто "не проверка"
             return False
-        return bool(_SITE_DOMAIN_PATTERN.search(el.inner_text() or ""))
+
+    def _pass_challenge_if_visible(self, page: Page, timeout_ms: int = 180_000) -> None:
+        """В видимом браузере (VK_HEADLESS=false) ждём, пока человек нажмёт «Продолжить» на
+        антибот-странице VK, и продолжаем отправку. В headless нажать некому — send_message
+        вернёт blocked-результат (прогон остановится без кулдауна аккаунта и порчи лида)."""
+        if settings.VK_HEADLESS or not self._is_challenge(page):
+            return
+        logger.warning(
+            "VK anti-bot challenge shown — ждём до %dс, пока вы нажмёте «Продолжить» в окне браузера",
+            timeout_ms // 1000,
+        )
+        try:
+            page.wait_for_function(
+                "() => !location.pathname.includes('challenge')"
+                " && !document.body.innerText.includes('Проверяем, что вы не робот')",
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            return
+        # Проверка пройдена — помечаем, чтобы tasks.py сохранил обновлённые cookies в Data Service
+        # (иначе следующий запуск снова получит challenge с той же старой сессией).
+        self.challenge_passed = True
+        logger.info("VK anti-bot challenge passed manually, refreshing saved session")
 
     def _detect_flood(self, page: Page) -> str | None:
         if page.query_selector(_CAPTCHA_SELECTOR) is not None:
@@ -330,8 +451,11 @@ class VkSendAdapter:
         return None
 
     def _type_like_human(self, page: Page, text: str) -> None:
-        for char in text:
-            page.type(_MESSAGE_INPUT_SELECTOR, char, delay=random.uniform(30, 120))
+        # По словам, а не по символу: один вызов Playwright на слово с задержкой между нажатиями
+        # внутри него — нажатия остаются настоящими keydown/keyup, но без RPC-оверхеда на каждый
+        # символ. Темп настраивается через TYPING_DELAY_MIN_MS/MAX_MS (см. config.py).
+        for chunk in ratelimit.type_chunks(text):
+            page.type(_MESSAGE_INPUT_SELECTOR, chunk, delay=ratelimit.typing_delay_ms())
 
     def _attach_image(self, page: Page, image: dict) -> bool:
         """image — Playwright FilePayload: {"name", "mimeType", "buffer"}. Возвращает False, если
@@ -466,7 +590,7 @@ class VkInboxAdapter:
             # Собственный независимый Playwright-драйвер целиком внутри этого потока — см.
             # предупреждение о потоках в докстринге класса.
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
+                browser = _launch_browser(pw)
                 context = browser.new_context(storage_state=self._storage_state or None)
                 _block_heavy_resources(context)
                 try:
@@ -516,7 +640,7 @@ class VkInboxAdapter:
         отрисовались) — тогда вызывающий код обязан пойти в полный обход, а не гадать.
         """
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
+            browser = _launch_browser(pw)
             context = browser.new_context(storage_state=self._storage_state or None)
             _block_heavy_resources(context)
             try:

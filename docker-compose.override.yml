@@ -1,0 +1,18 @@
+# Локальный оверрайд (не для коммита) — используется, когда parser-service и messaging-service
+# запускаются вне Docker (venv на хосте) ради видимого (headed) Playwright: у Linux-контейнеров
+# нет дисплея, поэтому headless:false там падает с "Missing X server or $DISPLAY".
+#
+# Контейнеры parser-service/messaging-service остаются описанными (orchestrator-service на них
+# ссылается через depends_on), но должны быть руками остановлены — `docker compose stop
+# parser-service messaging-service` — чтобы освободить порты 8002/8003 для локальных venv-версий.
+# orchestrator-service при этом стучится на хост-машину через host.docker.internal вместо
+# внутреннего DNS докер-сети.
+#
+# Чтобы вернуться к обычной работе (все 4 сервиса в докере): удалить этот файл и
+# `docker compose up --build -d`.
+
+services:
+  orchestrator-service:
+    environment:
+      PARSER_SERVICE_URL: http://host.docker.internal:8002
+      MESSAGING_SERVICE_URL: http://host.docker.internal:8003

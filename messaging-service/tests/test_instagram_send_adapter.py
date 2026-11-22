@@ -103,7 +103,7 @@ def test_send_message_success_happy_path():
 
     adapter = InstagramSendAdapter(storage_state={})
     with patch("app.adapters.instagram.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
-        with patch("app.adapters.instagram._sleep_random"):
+        with patch("app.ratelimit.settle"):
             result = adapter.send_message(_LEAD, _ACCOUNT, "hello")
 
     assert result.success is True

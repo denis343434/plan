@@ -77,6 +77,9 @@ def test_followup_sends_to_lead_overdue_by_three_days():
     respx.get(f"{BASE}/templates").mock(
         return_value=httpx.Response(200, json=[_template_payload(template_id, campaign_id)])
     )
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json={"id": campaign_id, "platform": "vk"})
+    )
     respx.get(f"{BASE}/leads").mock(
         side_effect=[
             httpx.Response(200, json=[_lead_payload(lead1)]),
@@ -123,6 +126,9 @@ def test_followup_skips_lead_not_yet_overdue():
     respx.get(f"{BASE}/templates").mock(
         return_value=httpx.Response(200, json=[_template_payload(template_id, campaign_id)])
     )
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json={"id": campaign_id, "platform": "vk"})
+    )
     respx.get(f"{BASE}/leads").mock(
         side_effect=[
             httpx.Response(200, json=[_lead_payload(lead1)]),
@@ -149,6 +155,9 @@ def test_followup_skips_lead_already_followed_up():
 
     respx.get(f"{BASE}/templates").mock(
         return_value=httpx.Response(200, json=[_template_payload(template_id, campaign_id)])
+    )
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json={"id": campaign_id, "platform": "vk"})
     )
     respx.get(f"{BASE}/leads").mock(
         side_effect=[

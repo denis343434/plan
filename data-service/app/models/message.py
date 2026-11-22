@@ -17,6 +17,8 @@ class Message(UUIDPK, Base):
             "reply_status IN ('none','replied','no_reply')", name="ck_messages_reply_status"
         ),
         Index("ix_messages_account_sent_at", "account_id", "sent_at"),
+        Index("ix_messages_lead_id_sent_at", "lead_id", "sent_at"),
+        Index("ix_messages_sent_at", "sent_at"),
     )
 
     lead_id: Mapped[UUID] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=False)

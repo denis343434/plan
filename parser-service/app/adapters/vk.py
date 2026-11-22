@@ -8,7 +8,13 @@ from urllib.parse import quote
 from playwright._impl._errors import TargetClosedError
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from app.adapters.base import CaptchaDetectedError, ParseFilters, RawLead
+from app.adapters.base import (
+    AntiBotChallengeError,
+    BrowserCrashedError,
+    CaptchaDetectedError,
+    ParseFilters,
+    RawLead,
+)
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -35,7 +41,10 @@ _SITE_DOMAIN_PATTERN = re.compile(r"[a-zа-яё0-9][a-zа-яё0-9-]*\.[a-zа-я�
 # Только после такого перехода страница реально показывает карточки — VKUI RichCell с
 # data-testid="group_item_desktop_list".
 _FEED_URL = "https://vk.ru/feed"
-_SEARCH_INPUT_SELECTOR = '[data-testid="search_top_input"]'
+# VK (редизайн, ноябрь 2026) убрал data-testid из всей вёрстки: на странице ленты/группы их
+# остаётся 0-3 служебных. Строка поиска теперь обычный input[type="search"] в шапке (#ts_wrap),
+# поэтому сначала ищем его, а старый data-testid оставлен вторым на случай отката/АБ.
+_SEARCH_INPUT_SELECTOR = '#ts_wrap input[type="search"], [data-testid="search_top_input"]'
 _RESULT_HEADER_SELECTOR = '[data-testid="header"]'
 # Проверено вживую 2026-08-21: сразу после Enter в DOM ненадолго появляется лёгкая подсказка-
 # автокомплит ("Недавние", "Люди", "Сообщества" — без кнопки "Показать все", без реальных
@@ -45,7 +54,9 @@ _RESULT_HEADER_SELECTOR = '[data-testid="header"]'
 # "Результаты поиска" — ждать нужно именно его, только потом искать секцию "Сообщества".
 _SEARCH_RESULTS_LABEL = "Результаты поиска"
 _COMMUNITIES_SECTION_LABEL = "Сообщества"
-_SHOW_ALL_SELECTOR = "text=Показать все"
+# "Показать все" в секции "Сообщества" — ссылка на полный список сообществ. VK держит её href
+# стабильным (/search/communities?q=...), в отличие от исчезнувших data-testid и вёрстки.
+_SHOW_ALL_SELECTOR = 'a[href*="/search/communities"]'
 _GROUP_CARD_SELECTOR = '[data-testid="group_item_desktop_list"]'
 # Выдача VK подгружает карточки бесконечным скроллом порциями (~20 за раз) — без явного
 # докручивания в DOM всегда только первая порция, независимо от filters.max_groups.
@@ -58,9 +69,96 @@ _MAX_SCROLL_ATTEMPTS = 25
 # 1500мс, и это ошибочно принималось за "выдача кончилась". Требуем NO_GROWTH_STALLS_TO_STOP
 # подряд пустых попыток (т.е. одну лишнюю паузу VK на "подумать"), прежде чем сдаться по-настоящему.
 _NO_GROWTH_STALLS_TO_STOP = 2
-_GROUP_LINK_SELECTOR = "a.vkuiAvatar__host"
-_GROUP_TITLE_SELECTOR = '[class*="vkuiHeadline"]'  # компонент не рендерит "__host", только "__level*"/"__density*"
+# Проверено вживую 2026-10-11 (кампания "Ювелирный салон" — парсинг молча возвращал 0 групп):
+# VK перешёл на хешированные CSS-классы ("meXqZJ vkitInternalRichAvatar ..."), прежние
+# "a.vkuiAvatar__host" / '[class*="vkuiHeadline"]' из карточки пропали, и _parse_card отбрасывал
+# КАЖДУЮ карточку. Классы больше не используем вовсе — только структуру: в карточке две ссылки на
+# группу (аватар с aria-label = название, и текстовая ссылка-заголовок), обе с относительным href.
+_GROUP_LINK_SELECTOR = 'a[href^="/"]'
 _CAPTCHA_SELECTOR = "div.captcha, form[action*='captcha']"
+
+# VK убрал data-testid, поэтому карточки выдачи/списка сообществ больше не находятся по
+# [data-testid="group_item_desktop_list"]. Собираем ссылки структурно: ссылка на сообщество
+# (/club123, /public123, /screen_name) в основном контенте (не в шапке и не в левом меню), у
+# которой в пределах 8 предков есть «подписчик»/«Подписаться» — это карточка сообщества.
+_COLLECT_CARDS_JS = """
+() => {
+  const out = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    const href = (a.getAttribute('href') || '').split('?')[0];
+    if (!/^\\/(club\\d+|public\\d+|event\\d+|[A-Za-z][A-Za-z0-9_.]{1,31})$/.test(href)) continue;
+    if (a.closest('#layout_sidebar') || a.closest('#page_header')) continue;
+    let node = a, isCard = false;
+    for (let i = 0; i < 8 && node.parentElement; i++) {
+      node = node.parentElement;
+      if (/подписчик|Подписаться/i.test(node.textContent || '')) { isCard = true; break; }
+    }
+    if (!isCard) continue;
+    out.push({href, title: (a.getAttribute('aria-label') || a.innerText || '').trim()});
+  }
+  return out;
+}
+"""
+
+_HAS_GROUP_LINK_JS = """
+() => Array.from(document.querySelectorAll('a[href]')).some((a) => {
+  if (a.closest('#layout_sidebar') || a.closest('#page_header')) return false;
+  const href = (a.getAttribute('href') || '').split('?')[0];
+  return /^\\/(club\\d+|public\\d+|event\\d+|[A-Za-z][A-Za-z0-9_.]{1,31})$/.test(href);
+})
+"""
+
+# Признак того, что страница группы отрисовала шапку (кнопка/счётчик подписчиков) — после этого
+# можно читать блок контактов. Раньше ждали именно [data-testid="group-info-site"], которого
+# больше нет; ждать "сайта" вообще нельзя (у большинства его нет).
+_GROUP_HEADER_READY_JS = """
+() => Array.from(document.querySelectorAll('*')).some(
+  (e) => e.children.length === 0 && /^(Подписчики|Подписаться|Участники)$/.test((e.textContent || '').trim())
+)
+"""
+
+# Сайт сообщества в новой вёрстке — ссылка-адрес в блоке контактов, у которой иконка глобуса
+# (svg.vkuiIcon--globe_outline_20). Это самый надёжный признак: он не зависит от того, в какой
+# колонке/на каком месте страницы VK нарисовал контакты (раньше проверка по координатам и длине
+# контейнера пропускала часть групп с сайтом). Дополнительно смотрим описание сообщества — VK
+# иногда показывает сайт только там. Мессенджеры/соцсети и короткие vk-ссылки сайтом не считаем.
+_SITE_CHECK_JS = """
+() => {
+  const ignoreHost = /(^|\\.)(vk\\.(com|ru|me|link|cc)|userapi\\.com|vk\\.company|vk\\.wiki|t\\.me|telegram\\.me|wa\\.me|whatsapp\\.com|max\\.ru|ok\\.ru|instagram\\.com|facebook\\.com|youtube\\.com|youtu\\.be|dzen\\.ru|rutube\\.ru)$/i;
+  const urlLike = /^(https?:\\/\\/)?[a-zа-яё0-9][a-zа-яё0-9.-]*\\.[a-zа-яё]{2,}(\\/.*)?$/i;
+  // Известные TLD, включая punycode для кириллических доменов (.рф/.москва/.рус/.бел/...): VK
+  // отдаёт такие адреса уже в punycode. Нужен только для описания — чтобы не спутать адрес
+  // ("ул.Университетская", который VK тоже превращает в ссылку) с настоящим сайтом.
+  const okTld = /^(xn--p1ai|xn--80adxhks|xn--p1acf|xn--90ais|ru|com|net|org|su|io|pro|shop|store|site|online|biz|info|me|club|tech|studio|digital|agency|center|group|company|design|art|space|xyz|top|moscow)$/i;
+  const found = [];
+  const push = (href, strict) => {
+    let target = href || '';
+    const m = target.match(/away\\.php\\?to=([^&]+)/);
+    if (m) { try { target = decodeURIComponent(m[1]); } catch (e) {} }
+    // Instagram в любом виде (instagram.com, www./l.instagram.com, instagr.am, ссылка вида
+    // ".../instagram") — не собственный сайт сообщества: такую группу пишем как "без сайта".
+    if (/instagram/i.test(target) || /instagr\\.am/i.test(target)) return;
+    let host = '';
+    try { host = new URL(target, 'https://vk.com').hostname; } catch (e) { host = ''; }
+    if (!host || ignoreHost.test(host)) return;
+    if (strict) {
+      const tld = host.split('.').pop() || '';
+      if (!okTld.test(tld)) return;
+    }
+    if (!found.includes(host)) found.push(host);
+  };
+  // 1) Строка "сайт" в контактах: ссылка с иконкой глобуса — так VK рисует именно сайт. Здесь
+  //    доверяем самой иконке: домен может быть кириллическим (punycode) — это всё равно сайт.
+  for (const a of document.querySelectorAll('a[href]')) {
+    if (a.querySelector('svg[class*="globe"]')) push(a.getAttribute('href'), false);
+  }
+  // 2) Сайт, указанный в описании сообщества (VK показывает его там, если поле контактов пустое).
+  for (const a of document.querySelectorAll('[elementtiming*="community_description"] a[href]')) {
+    if (urlLike.test((a.innerText || '').trim())) push(a.getAttribute('href'), true);
+  }
+  return found;
+}
+"""
 
 # Таймаут на признак "залогинены" короче, чем _SLOW_RENDER_TIMEOUT_MS в других местах файла —
 # это ручная разовая проверка из панели (см. routers/accounts.py), а не фоновая задача, где
@@ -76,6 +174,10 @@ _SESSION_CHECK_TIMEOUT_MS = 15_000
 # уже чинили для messaging-service/app/adapters/vk.py, здесь дублируем по тому же принципу).
 # НЕ проверено вживую под devtools — заведено по скриншоту, а не по разметке.
 _LOGIN_REQUIRED_TEXT = "Выберите аккаунт для входа"
+
+# Новая антибот-страница VK (challenge.html): "Проверяем, что вы не робот" + кнопка "Продолжить".
+# Проходить её автоматически нельзя/бессмысленно — нужен видимый браузер и ручное действие.
+_CHALLENGE_TEXT = "Проверяем, что вы не робот"
 
 # Анонимный режим (use_account=False у кампании, см. app/tasks.py::run_parse_task) — SPA-поиск
 # через шапку ленты (_open_communities_search выше) доступен только залогиненным: без cookies
@@ -133,6 +235,35 @@ _BLOCKED_URL_SUBSTRINGS = (
 )
 
 
+def _normalize_title(text: str) -> str:
+    return " ".join(text.lower().replace("ё", "е").split())
+
+
+def _is_excluded_title(title: str | None) -> bool:
+    """True, если в названии группы есть стоп-фраза из VK_EXCLUDED_TITLE_PHRASES — такие группы
+    (например, "Ищу модель" — объявления о поиске моделей, а не бизнес) не нужны как лиды."""
+    if not title:
+        return False
+    normalized = _normalize_title(title)
+    return any(
+        phrase and phrase in normalized
+        for phrase in (_normalize_title(p) for p in settings.VK_EXCLUDED_TITLE_PHRASES)
+    )
+
+
+def _is_driver_dead(exc: BaseException) -> bool:
+    # Умер сам процесс драйвера Playwright (node.exe), а не браузер/вкладка: Playwright бросает
+    # обычный Error "Connection closed while reading from the driver", НЕ TargetClosedError, и
+    # раньше он ловился общим except в _has_external_site как сбой одного кандидата — цикл шёл
+    # дальше, а следующий вызов в мёртвый драйвер навсегда вешал поток (задача висела в
+    # running на 186/381, см. запрос пользователя 2026-10-23).
+    return "Connection closed while reading from the driver" in str(exc)
+
+
+def _is_browser_dead(exc: BaseException) -> bool:
+    return isinstance(exc, TargetClosedError) or _is_driver_dead(exc)
+
+
 def _block_heavy_resources(context) -> None:
     def handler(route) -> None:
         request = route.request
@@ -182,7 +313,12 @@ class VkParserAdapter:
         on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
         leads: list[RawLead] = []
-        with sync_playwright() as pw:
+        # Не `with sync_playwright()`: его __exit__ (как и context/browser.close()) после смерти
+        # драйвера может так и не вернуться — тогда собранные лиды не дошли бы до вызывающего
+        # кода. При мёртвом драйвере закрытие просто пропускаем (закрывать уже нечего).
+        pw = sync_playwright().start()
+        driver_dead = False
+        try:
             browser = pw.chromium.launch(headless=settings.VK_HEADLESS)
             context = browser.new_context(storage_state=self._storage_state or None)
             _block_heavy_resources(context)
@@ -192,19 +328,14 @@ class VkParserAdapter:
                     self._open_communities_search(page, keyword, leads)
 
                     try:
-                        page.wait_for_selector(_GROUP_CARD_SELECTOR, timeout=15_000)
+                        page.wait_for_function(_HAS_GROUP_LINK_JS, timeout=15_000)
                     except PlaywrightTimeoutError:
                         pass  # ни одной группы по запросу — не ошибка, просто пустой результат
 
                     if filters.max_groups is not None:
                         self._scroll_until_enough_new_candidates(page, filters)
 
-                    candidates = [
-                        lead
-                        for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
-                        if (lead := self._parse_card(card, filters)) is not None
-                        and lead.external_id not in filters.known_external_ids
-                    ]
+                    candidates = self._collect_candidates(page, filters)
                 else:
                     candidates = self._search_communities_anonymous(page, keyword, filters, leads)
 
@@ -224,9 +355,22 @@ class VkParserAdapter:
                         on_progress(checked, total, len(leads))
                     if filters.max_groups is not None and len(leads) >= filters.max_groups:
                         break  # набрали нужное количество — дальше кандидатов не проверяем
+            except Exception as exc:
+                if not _is_browser_dead(exc):
+                    raise
+                driver_dead = _is_driver_dead(exc)
+                raise BrowserCrashedError(f"browser crashed: {exc}", partial_leads=leads) from exc
             finally:
-                context.close()
-                browser.close()
+                if not driver_dead:
+                    try:
+                        context.close()
+                        browser.close()
+                    except Exception:
+                        # Браузер уже закрыт (TargetClosedError выше) — не затираем исходную ошибку.
+                        logger.warning("failed to close VK browser", exc_info=True)
+        finally:
+            if not driver_dead:
+                pw.stop()
         return leads
 
     def _open_communities_search(self, page: Page, keyword: str, collected_so_far: list[RawLead]) -> None:
@@ -242,6 +386,8 @@ class VkParserAdapter:
         # SPA с фоновыми вебсокетами/long-polling (онлайн-статус, аналитика), из-за которых
         # событие "load" может не наступить вовсе, хотя сам контент уже отрисован.
         page.goto(_FEED_URL, wait_until="domcontentloaded")
+        self._pass_challenge_if_visible(page)  # видимый браузер: ждём ручное «Продолжить»
+        self._raise_if_captcha(page, collected_so_far)  # антибот-страница видна по URL сразу
         try:
             # Проверено вживую 2026-08-21: реальный контент VK в этом окружении иногда
             # прогружается только через ~18-20с после domcontentloaded (страница до этого
@@ -253,6 +399,7 @@ class VkParserAdapter:
             # что и в комментарии выше), instant-проверка тогда всегда мимо (см. запрос
             # пользователя 2026-08-24 — первая версия этой проверки ничего не находила).
             _raise_if_login_required(page)
+            self._raise_if_captcha(page, collected_so_far)  # антибот-страница тоже даёт таймаут
             raise RuntimeError("VK не догрузился — строка поиска в шапке не появилась за 30с")
         self._raise_if_captcha(page, collected_so_far)
 
@@ -262,30 +409,20 @@ class VkParserAdapter:
         page.keyboard.press("Enter")
 
         # Ждём именно "Результаты поиска" (см. комментарий у _SEARCH_RESULTS_LABEL) — маркер
-        # настоящей страницы результатов, а не мимолётной подсказки-автокомплита.
-        if not self._wait_for_header_containing(page, _SEARCH_RESULTS_LABEL, timeout=20_000):
+        # настоящей страницы результатов, а не мимолётной подсказки-автокомплита. Раньше это
+        # был поиск заголовка по [data-testid="header"], теперь testid нет — берём текст.
+        if not self._wait_for_text(page, _SEARCH_RESULTS_LABEL, timeout=20_000):
             return  # настоящая страница результатов не подгрузилась за 20с — 0 карточек
         self._raise_if_captcha(page, collected_so_far)
 
-        # Секции результатов ("Сообщества", "Видео", ...) могут дорисовываться по одной уже
-        # ПОСЛЕ самого "Результаты поиска" — отдельное ожидание именно её, не полагаемся на то,
-        # что она уже в DOM к этому моменту.
-        if not self._wait_for_header_containing(page, _COMMUNITIES_SECTION_LABEL, timeout=10_000):
-            return  # секции "Сообщества" в выдаче нет вовсе — по запросу их точно 0
-
-        communities_header = None
-        for header in page.query_selector_all(_RESULT_HEADER_SELECTOR):
-            if _COMMUNITIES_SECTION_LABEL in (header.inner_text() or ""):
-                communities_header = header
-                break
-        if communities_header is None:
-            return  # не должно случиться после wait_for_header_containing выше, но не гадаем
-
-        show_all = communities_header.query_selector(_SHOW_ALL_SELECTOR)
+        # Секция "Сообщества" может дорисовываться уже ПОСЛЕ "Результаты поиска". Кнопка
+        # "Показать все" ведёт на полный список сообществ (/search/communities?q=...) — ждать
+        # заголовок секции отдельно больше не нужно, достаточно самой ссылки.
+        show_all = page.query_selector(_SHOW_ALL_SELECTOR)
         if show_all is None:
-            return  # все найденные сообщества уже показаны прямо тут, докручивать некуда
+            return  # все найденные сообщества уже показаны на странице результатов
         show_all.click()
-        page.wait_for_timeout(1500)  # переход внутри SPA, не полная навигация — короткая пауза
+        page.wait_for_timeout(2000)  # переход внутри SPA, не полная навигация — короткая пауза
 
     def _search_communities_anonymous(
         self, page: Page, keyword: str, filters: ParseFilters, collected_so_far: list[RawLead]
@@ -297,9 +434,9 @@ class VkParserAdapter:
         url = _ANON_SEARCH_URL_TEMPLATE.format(query=quote(keyword))
         try:
             page.goto(url, wait_until="domcontentloaded")
-        except TargetClosedError:
-            raise  # браузер мёртв целиком — см. тот же приём и комментарий у _has_external_site
-        except Exception:
+        except Exception as exc:
+            if _is_browser_dead(exc):
+                raise  # браузер мёртв целиком — см. тот же приём и комментарий у _has_external_site
             logger.warning("anonymous VK search failed to load %s", url, exc_info=True)
             return []
         page.wait_for_timeout(2000)  # легаси-страница без SPA-роутинга — простая пауза на рендер
@@ -366,24 +503,39 @@ class VkParserAdapter:
         if external_id.split(".", 1)[0] in _ANON_IGNORED_PATH_SEGMENTS:
             return None
         title = (link.inner_text() or "").strip() or None
+        if _is_excluded_title(title):
+            return None
         return RawLead(external_id=external_id, group_url=f"https://vk.com/{external_id}", title=title)
 
-    def _wait_for_header_containing(self, page: Page, label: str, timeout: int) -> bool:
-        """True, если за timeout мс среди [data-testid="header"] появился хотя бы один с
-        текстом, содержащим label. False — не дождались (не гадаем, что это значит — решает
-        вызывающий код)."""
+    def _wait_for_text(self, page: Page, text: str, timeout: int) -> bool:
+        """True, если за timeout мс на странице появился элемент с таким текстом. False — не
+        дождались (не гадаем, что это значит — решает вызывающий код). Замена прежнему поиску
+        по [data-testid="header"], который VK убрал из вёрстки."""
         try:
-            page.wait_for_function(
-                """
-                (label) => Array.from(document.querySelectorAll('[data-testid="header"]'))
-                    .some((el) => el.textContent && el.textContent.includes(label))
-                """,
-                arg=label,
-                timeout=timeout,
-            )
+            page.wait_for_selector(f"text={text}", timeout=timeout)
             return True
         except PlaywrightTimeoutError:
             return False
+
+    def _collect_candidates(self, page: Page, filters: ParseFilters, skip_known: bool = True) -> list[RawLead]:
+        """Ссылки на сообщества из текущей выдачи (карточки ищем структурно, без data-testid —
+        см. _COLLECT_CARDS_JS). Дубли (аватар и заголовок одной карточки) схлопываются по
+        external_id, первая непустая подпись становится названием."""
+        seen: set[str] = set()
+        result: list[RawLead] = []
+        for item in page.evaluate(_COLLECT_CARDS_JS) or []:
+            href = (item.get("href") or "").split("?", 1)[0]
+            external_id = href.lstrip("/")
+            if not external_id or external_id in seen:
+                continue
+            seen.add(external_id)
+            if skip_known and external_id in filters.known_external_ids:
+                continue
+            title = (item.get("title") or "").strip() or None
+            if _is_excluded_title(title):
+                continue
+            result.append(RawLead(external_id=external_id, group_url=f"https://vk.com/{external_id}", title=title))
+        return result
 
     def _scroll_until_enough_new_candidates(self, page: Page, filters: ParseFilters) -> None:
         # Хотим минимум max_groups карточек в DOM, которых ещё нет в known_external_ids —
@@ -392,23 +544,21 @@ class VkParserAdapter:
         # докрутка останавливалась на первой же порции, целиком состоящей из уже известных
         # групп, и парсер каждый раз "находил" одно и то же вместо того, чтобы уйти дальше.
         def count_new() -> int:
-            return sum(
-                1
-                for card in page.query_selector_all(_GROUP_CARD_SELECTOR)
-                if (lead := self._parse_card(card, filters)) is not None
-                and lead.external_id not in filters.known_external_ids
-            )
+            return len(self._collect_candidates(page, filters))
+
+        def count_all() -> int:
+            return len(self._collect_candidates(page, filters, skip_known=False))
 
         max_groups = filters.max_groups
         new_count = count_new()
-        total_loaded = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+        total_loaded = count_all()
         stalls = 0
         for _ in range(_MAX_SCROLL_ATTEMPTS):
             if max_groups is not None and new_count >= max_groups:
                 return
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(_SCROLL_WAIT_MS)
-            current_total = len(page.query_selector_all(_GROUP_CARD_SELECTOR))
+            current_total = count_all()
             if current_total == total_loaded:
                 stalls += 1
                 if stalls >= _NO_GROWTH_STALLS_TO_STOP:
@@ -434,7 +584,13 @@ class VkParserAdapter:
             try:
                 page.goto(group_url, wait_until="domcontentloaded")
                 break
-            except TargetClosedError:
+            except Exception as exc:
+                if not _is_browser_dead(exc):
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    logger.warning("failed to load group page %s, skipping (unknown site status)", group_url, exc_info=True)
+                    return None
                 # Браузер/страница закрылись целиком (краш вкладки и т.п.), а не сбой конкретного
                 # goto — ретраить и продолжать перебор кандидатов бессмысленно, КАЖДЫЙ следующий
                 # goto в этом же прогоне упадёт той же ошибкой. Раньше это тихо ловилось общим
@@ -442,33 +598,36 @@ class VkParserAdapter:
                 # секунду, пока не выбирал весь список — на кампании в сотни групп так уходило
                 # больше POLL_TIMEOUT_SEC оркестратора (см. запрос пользователя 2026-09-03, лог
                 # 338 подряд TargetClosedError, "фаза: таймаут · ошибка: parser: running").
-                # Пробрасываем наверх, чтобы весь search_communities прервался сразу.
+                # Пробрасываем наверх, чтобы весь search_communities прервался сразу. То же для
+                # смерти самого драйвера (см. _is_driver_dead).
                 raise
-            except Exception:
-                if attempt == 0:
-                    time.sleep(1.0)
-                    continue
-                logger.warning("failed to load group page %s, skipping (unknown site status)", group_url, exc_info=True)
-                return None
 
+        self._pass_challenge_if_visible(page)
         try:
-            page.wait_for_selector(_SITE_FIELD_SELECTOR, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS)
+            page.wait_for_function(_GROUP_HEADER_READY_JS, timeout=settings.VK_SITE_CHECK_TIMEOUT_MS * 2)
         except PlaywrightTimeoutError:
             # Проверяем ПОСЛЕ таймаута, а не сразу после goto — см. тот же приём и комментарий
             # в _open_communities_search. Если это он — SessionExpiredError пробрасывается
             # наверх отсюда же (не ловится ниже: раз уж КАЖДЫЙ оставшийся кандидат в этом же
             # цикле получил бы ту же мёртвую сессию, см. запрос пользователя 2026-08-24).
             _raise_if_login_required(page)
-            return False  # страница уже загрузилась (goto прошёл) — поля просто нет, сайта нет
-        except TargetClosedError:
-            raise  # см. комментарий у goto выше — браузер мёртв целиком, не сбой этого кандидата
-        except Exception:
+            # Не дождались шапки — НЕ считаем это "сайта нет" (раньше так и было, из-за чего
+            # группа с сайтом на медленной странице попадала в "без сайта"). None = не смогли
+            # проверить, кандидат просто уйдёт на следующий прогон.
+            logger.info("group header did not render for %s, skipping (unknown site status)", group_url)
+            return None
+        except Exception as exc:
+            if _is_browser_dead(exc):
+                raise  # см. комментарий у goto выше — браузер мёртв целиком, не сбой этого кандидата
             logger.warning("failed to check site presence for %s, skipping (unknown site status)", group_url, exc_info=True)
             return None
-        el = page.query_selector(_SITE_FIELD_SELECTOR)
-        if el is None:
-            return False
-        return bool(_SITE_DOMAIN_PATTERN.search(el.inner_text() or ""))
+        try:
+            return bool(page.evaluate(_SITE_CHECK_JS))
+        except Exception as exc:
+            if _is_browser_dead(exc):
+                raise
+            logger.warning("failed to read site block for %s, skipping (unknown site status)", group_url, exc_info=True)
+            return None
 
     def _parse_card(self, card, filters: ParseFilters) -> RawLead | None:
         link = card.query_selector(_GROUP_LINK_SELECTOR)
@@ -481,8 +640,15 @@ class VkParserAdapter:
         if not external_id:
             return None
 
-        title_el = card.query_selector(_GROUP_TITLE_SELECTOR)
-        title = title_el.inner_text().strip() if title_el is not None else None
+        # Название: aria-label аватара, иначе текст первой непустой ссылки карточки (заголовок).
+        title = (link.get_attribute("aria-label") or "").strip() or None
+        if title is None:
+            for title_link in card.query_selector_all(_GROUP_LINK_SELECTOR):
+                if text := (title_link.inner_text() or "").strip():
+                    title = text
+                    break
+        if _is_excluded_title(title):
+            return None
 
         return RawLead(
             external_id=external_id,
@@ -490,7 +656,44 @@ class VkParserAdapter:
             title=title,
         )
 
+    def _is_challenge(self, page: Page) -> bool:
+        url = page.url
+        challenge_url = isinstance(url, str) and "challenge.html" in url
+        try:
+            challenge_locator_hit = page.locator(f"text={_CHALLENGE_TEXT}").count() > 0
+        except TypeError:  # MagicMock в юнит-тестах вместо реального счётчика
+            challenge_locator_hit = False
+        return challenge_url or challenge_locator_hit
+
+    def _pass_challenge_if_visible(self, page: Page, timeout_ms: int = 180_000) -> None:
+        """В видимом браузере (VK_HEADLESS=false) даём человеку нажать «Продолжить» на
+        антибот-странице VK и продолжаем прогон, вместо того чтобы сразу падать ошибкой.
+        В headless нажать некому — там проверка сразу уходит наверх как AntiBotChallengeError."""
+        if settings.VK_HEADLESS or not self._is_challenge(page):
+            return
+        logger.warning(
+            "VK anti-bot challenge shown — ждём до %dс, пока вы нажмёте «Продолжить» в окне браузера",
+            timeout_ms // 1000,
+        )
+        try:
+            page.wait_for_function(
+                "() => !location.pathname.includes('challenge')"
+                " && !document.body.innerText.includes('Проверяем, что вы не робот')",
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            pass  # не дождались — _raise_if_captcha ниже даст понятную ошибку
+
     def _raise_if_captcha(self, page: Page, collected_so_far: list[RawLead]) -> None:
+        # Отдельно ловим новую антибот-страницу VK (challenge.html/"Проверяем, что вы не робот"):
+        # в ней нет ни div.captcha, ни form[action*=captcha], поэтому раньше она выглядела как
+        # "VK не догрузился за 30с" и уводила в поиск несуществующих проблем с селекторами.
+        if self._is_challenge(page):
+            raise AntiBotChallengeError(
+                "VK показывает антибот-проверку «Проверяем, что вы не робот» — "
+                "включите видимый браузер (VK_HEADLESS=false) и нажмите «Продолжить» вручную",
+                collected_so_far,
+            )
         if page.query_selector(_CAPTCHA_SELECTOR) is not None:
             raise CaptchaDetectedError("VK captcha/anti-bot check detected", collected_so_far)
 

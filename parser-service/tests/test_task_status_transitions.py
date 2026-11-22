@@ -3,7 +3,7 @@ import uuid
 import httpx
 import respx
 
-from app.adapters.base import CaptchaDetectedError
+from app.adapters.base import AntiBotChallengeError, CaptchaDetectedError
 from app.config import settings
 from app.schemas.parse import ParseFiltersSchema
 from app.tasks import TaskStatus, create_task, run_parse_task
@@ -117,6 +117,46 @@ def test_captcha_cooldowns_account_and_does_not_release_it(monkeypatch):
     assert task.status == TaskStatus.failed
     assert cooldown_route.called
     assert not release_route.called
+
+
+@respx.mock
+def test_anti_bot_challenge_does_not_cooldown_account(monkeypatch):
+    """Антибот-страница VK привязана к IP/браузеру, а не к аккаунту: из-за неё рабочий аккаунт
+    не должен уходить в 30-минутный кулдаун (иначе каждая попытка парсинга его "закрывает")."""
+    account_id = str(uuid.uuid4())
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
+    respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
+    )
+    cooldown_route = respx.post(f"{BASE}/accounts/{account_id}/cooldown").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="cooldown"))
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    class _ChallengeAdapter:
+        def search_communities(self, keyword, filters, on_progress=None):
+            raise AntiBotChallengeError("anti-bot challenge", partial_leads=[])
+
+    monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _ChallengeAdapter())
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None)
+
+    assert task.status == TaskStatus.failed
+    assert task.error == "anti-bot challenge"
+    assert not cooldown_route.called
+    assert release_route.called
 
 
 @respx.mock
@@ -249,3 +289,42 @@ def test_instagram_task_without_account_fails_fast_without_touching_accounts():
 
     assert task.status == TaskStatus.failed
     assert "без аккаунта" in task.error
+
+
+@respx.mock
+def test_browser_crash_saves_partial_leads_and_releases_account(monkeypatch):
+    from app.adapters.base import BrowserCrashedError, RawLead
+
+    account_id = str(uuid.uuid4())
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
+    bulk_route = respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 1, "skipped": 0, "lead_ids": []})
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    lead = RawLead(external_id="club1", group_url="https://vk.com/club1", title=None)
+
+    class _CrashAdapter:
+        def search_communities(self, keyword, filters, on_progress=None):
+            raise BrowserCrashedError("browser crashed", partial_leads=[lead])
+
+    monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _CrashAdapter())
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None)
+
+    assert task.status == TaskStatus.failed
+    assert task.inserted == 1
+    assert bulk_route.called
+    assert release_route.called

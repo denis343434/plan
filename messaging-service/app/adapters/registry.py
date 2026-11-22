@@ -12,6 +12,18 @@ def get_adapter(platform: str, storage_state: dict | None = None) -> SendAdapter
         from app.adapters.instagram import InstagramSendAdapter  # lazy: same reason as VK above
 
         return InstagramSendAdapter(storage_state or {})
+    if platform == "tg" and settings.TG_ADAPTER_MODE == "playwright":
+        from app.adapters.web_messenger import TelegramSendAdapter  # lazy: same reason as VK above
+
+        return TelegramSendAdapter(storage_state or {})
+    if platform == "whatsapp" and settings.WA_ADAPTER_MODE == "playwright":
+        from app.adapters.web_messenger import WhatsAppSendAdapter  # lazy: same reason as VK above
+
+        return WhatsAppSendAdapter(storage_state or {})
+    if platform == "facebook" and settings.FB_ADAPTER_MODE == "playwright":
+        from app.adapters.web_messenger import FacebookSendAdapter  # lazy: same reason as VK above
+
+        return FacebookSendAdapter(storage_state or {})
     return DryRunAdapter(platform)
 
 

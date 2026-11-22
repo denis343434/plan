@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from stats_tab import StatsTab
+from yandex_tab import GOOGLE, YANDEX, YandexMapsTab
+
 # Локальный "гейт" перед панелью — не серьёзная аутентификация (сами API Data/Parser/
 # Messaging/Orchestrator по-прежнему открыты на localhost без какой-либо проверки), а просто
 # экран входа, чтобы окно не открывалось сразу для кого угодно за компьютером.
@@ -38,6 +41,9 @@ MESSAGING_URL = f"http://{HOST}:8003"
 # stdlib-only зависимостей: требует `pip install playwright httpx` и `playwright install chromium`.
 VK_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "parser-service" / "scripts" / "vk_manual_login.py"
 IG_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "parser-service" / "scripts" / "instagram_manual_login.py"
+# Один скрипт на Telegram Web, WhatsApp Web и Facebook (--platform tg|whatsapp|facebook) — аккаунты по
+# лидам из Яндекс Карт (см. вкладку «Яндекс карты», yandex_tab.py).
+MESSENGER_LOGIN_SCRIPT = Path(__file__).resolve().parent.parent / "parser-service" / "scripts" / "messenger_manual_login.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ORCHESTRATOR_URL = f"http://{HOST}:8004"
 
@@ -97,7 +103,13 @@ RU_PURPOSE_REVERSE = {v: k for k, v in RU_PURPOSE.items()}
 # "telegram") — иначе выбор в комбобоксе уходит на бэкенд строкой, не проходящей Pydantic-
 # валидацию (сама Instagram-запись этой проблемы не имела, ключ и значение платформы у неё и
 # так совпадают).
-PLATFORM_LABELS = {"vk": "VK", "tg": "Telegram", "instagram": "Instagram"}
+PLATFORM_LABELS = {
+    "vk": "VK", "tg": "Telegram", "instagram": "Instagram", "whatsapp": "WhatsApp", "facebook": "Facebook",
+}
+# Платформы, для которых есть поиск на основной вкладке (WhatsApp — только канал рассылки
+# для Яндекс Карт, искать в нём нечего; сами кампании Яндекс Карт создаются на своей вкладке).
+CAMPAIGN_FORM_PLATFORMS = ("vk", "tg", "instagram")
+CAMPAIGN_PLATFORM_LABELS = {**PLATFORM_LABELS, "yandex_maps": "Я.Карты", "google_maps": "G.Карты"}
 PLATFORM_REVERSE = {v: k for k, v in PLATFORM_LABELS.items()}
 
 
@@ -291,8 +303,23 @@ class App(tk.Tk):
         self.status_bar = ttk.Label(self, text="", anchor="w", padding=(14, 3), relief="sunken")
         self.status_bar.pack(fill="x", side="bottom")
 
-        body = ttk.Frame(self, padding=10)
-        body.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        body = ttk.Frame(notebook, padding=10)
+        notebook.add(body, text="VK / Instagram")
+        self.yandex_tab = YandexMapsTab(
+            notebook, self, api_request,
+            urls={"data": DATA_URL, "orchestrator": ORCHESTRATOR_URL, "messaging": MESSAGING_URL},
+        )
+        notebook.add(self.yandex_tab, text=YANDEX.title)
+        self.google_tab = YandexMapsTab(
+            notebook, self, api_request,
+            urls={"data": DATA_URL, "orchestrator": ORCHESTRATOR_URL, "messaging": MESSAGING_URL},
+            source=GOOGLE,
+        )
+        notebook.add(self.google_tab, text=GOOGLE.title)
+        self.stats_tab = StatsTab(notebook, self, api_request, data_url=DATA_URL)
+        notebook.add(self.stats_tab, text="Статистика")
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=0)
@@ -395,6 +422,15 @@ class App(tk.Tk):
         ttk.Button(acc_actions, text="Тестовая сессия для выбранного", command=self.on_set_session).pack(side="left")
         ttk.Button(acc_actions, text="Войти в VK", command=self.on_vk_login).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Войти в Instagram", command=self.on_instagram_login).pack(side="left", padx=(6, 0))
+        ttk.Button(acc_actions, text="Войти в Telegram", command=lambda: self.on_messenger_login("tg")).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(acc_actions, text="Войти в WhatsApp", command=lambda: self.on_messenger_login("whatsapp")).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(acc_actions, text="Войти в Facebook", command=lambda: self.on_messenger_login("facebook")).pack(
+            side="left", padx=(6, 0)
+        )
         ttk.Button(acc_actions, text="Проверить сессии", command=self.on_check_sessions).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Остановить аккаунт", style="Danger.TButton", command=self.on_pause_account).pack(side="left", padx=(6, 0))
         ttk.Button(acc_actions, text="Продолжить", style="Success.TButton", command=self.on_resume_account).pack(side="left", padx=(6, 0))
@@ -409,7 +445,9 @@ class App(tk.Tk):
         self.camp_name = ttk.Entry(form, width=16)
         self.camp_name.grid(row=0, column=0, padx=2)
         self._placeholder(self.camp_name, "название")
-        self.camp_platform = ttk.Combobox(form, values=list(PLATFORM_LABELS.values()), width=10, state="readonly")
+        self.camp_platform = ttk.Combobox(
+            form, values=[PLATFORM_LABELS[p] for p in CAMPAIGN_FORM_PLATFORMS], width=10, state="readonly"
+        )
         self.camp_platform.set(PLATFORM_LABELS["vk"])
         self.camp_platform.grid(row=0, column=1, padx=2)
         self.camp_keyword = ttk.Entry(form, width=14)
@@ -569,8 +607,11 @@ class App(tk.Tk):
             try:
                 result = fn()
             except Exception as exc:  # noqa: BLE001 - показываем любую ошибку пользователю
+                # exc передаём аргументом по умолчанию: Python удаляет имя из except по выходу из
+                # блока, и lambda без привязки падала с NameError — on_error не вызывался вовсе,
+                # опрос статуса молча обрывался и UI "замирал".
                 if on_error and is_current():
-                    self.after(0, lambda: on_error(exc))
+                    self.after(0, lambda err=exc: on_error(err))
                 return
             if on_done and is_current():
                 self.after(0, lambda: on_done(result))
@@ -841,6 +882,45 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Вход в Instagram", f"Не удалось запустить скрипт логина: {exc}")
 
+    def on_messenger_login(self, platform: str) -> None:
+        # Тот же приём, что on_vk_login/on_instagram_login, — отдельная консоль со скриптом входа.
+        title = PLATFORM_LABELS[platform]
+        selected = self.acc_tree.selection()
+        if not selected:
+            messagebox.showinfo(f"Вход в {title}", "Сначала выберите аккаунт в таблице")
+            return
+        account_id = selected[0]
+        account = self._accounts_cache.get(account_id, {})
+        if account.get("platform") != platform:
+            messagebox.showwarning(
+                f"Вход в {title}",
+                f"Выбранный аккаунт создан для платформы «{PLATFORM_LABELS.get(account.get('platform'), '?')}» — "
+                f"создайте аккаунт с платформой {title}",
+            )
+            return
+        if not MESSENGER_LOGIN_SCRIPT.exists():
+            messagebox.showerror(f"Вход в {title}", f"Не найден скрипт: {MESSENGER_LOGIN_SCRIPT}")
+            return
+        how = "логин/пароль и код 2FA, если попросит" if platform == "facebook" else "QR-код с телефона или по номеру"
+        if not messagebox.askyesno(
+            f"Вход в {title}",
+            f"Откроется отдельное окно браузера — войди в {title} ({how}), дождись загрузки, затем "
+            "вернись в открывшуюся консоль и нажми Enter, чтобы сохранить сессию.\n\nПродолжить?",
+        ):
+            return
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable, str(MESSENGER_LOGIN_SCRIPT), "--platform", platform,
+                    "--account-id", account_id, "--data-service-url", DATA_URL,
+                ],
+                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+                cwd=str(MESSENGER_LOGIN_SCRIPT.parent.parent),
+            )
+            self.flash_status(f"Окно входа в {title} открывается в отдельной консоли…")
+        except OSError as exc:
+            messagebox.showerror(f"Вход в {title}", f"Не удалось запустить скрипт входа: {exc}")
+
     def _set_session_cell(self, account_id: str, text: str, tag: str) -> None:
         if not self.acc_tree.exists(account_id):
             return
@@ -906,7 +986,7 @@ class App(tk.Tk):
                 self.camp_tree.insert(
                     "", "end", iid=c["id"],
                     values=(
-                        c["name"], PLATFORM_LABELS.get(c["platform"], c["platform"]), c["keyword"],
+                        c["name"], CAMPAIGN_PLATFORM_LABELS.get(c["platform"], c["platform"]), c["keyword"],
                         "в аккаунте" if c.get("use_account", True) else "без аккаунта",
                         RU_CAMPAIGN_STATUS.get(c["status"], c["status"]),
                     ),
@@ -977,7 +1057,6 @@ class App(tk.Tk):
                 self.detail_stats.configure(text="")
                 self.detail_status.configure(text="")
                 self.leads_tree.delete(*self.leads_tree.get_children())
-                self.tpl_list_label.configure(text="")
             self.refresh_campaigns()
 
         def error(exc):

@@ -16,6 +16,7 @@ class Lead(UUIDPK, Base):
             name="ck_leads_status",
         ),
         Index("ix_leads_status_platform_campaign", "status", "platform", "campaign_id"),
+        Index("ix_leads_campaign_id", "campaign_id"),
     )
 
     platform: Mapped[str] = mapped_column(nullable=False)

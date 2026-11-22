@@ -6,7 +6,6 @@ from app.adapters.vk import (
     _MESSAGE_INPUT_SELECTOR,
     _SEND_BUTTON_SELECTOR,
     _SEND_MESSAGE_BUTTON_SELECTOR,
-    _SITE_FIELD_SELECTOR,
     VkSendAdapter,
 )
 
@@ -15,14 +14,13 @@ _ACCOUNT = {"id": "acc-1"}
 
 
 def _no_site_wait_for_selector(send_btn: MagicMock):
-    """selector-осведомлённый side_effect для page.wait_for_selector: имитирует "поля сайта
-    нет" для _SITE_FIELD_SELECTOR, а на кнопку "Написать сообщение" отвечает send_btn — так же,
-    как настоящая страница группы без сайта. Остальные селекторы (поле ввода сообщения) не
-    находит, чтобы тест не улетал дальше happy-path, если это не нужно конкретному тесту."""
+    """selector-осведомлённый side_effect для page.wait_for_selector: на кнопку "Написать
+    сообщение" отвечает send_btn — так же, как настоящая страница группы без сайта. Остальные
+    селекторы (поле ввода сообщения) не находит, чтобы тест не улетал дальше happy-path, если это
+    не нужно конкретному тесту. Проверка сайта теперь идёт через page.evaluate — тесты, которым
+    важно "сайта нет", выставляют page.evaluate.return_value = [] сами."""
 
     def wait_for_selector(selector, timeout=None):
-        if selector == _SITE_FIELD_SELECTOR:
-            raise PlaywrightTimeoutError("site field never appeared")
         if selector == _SEND_MESSAGE_BUTTON_SELECTOR:
             return send_btn
         raise PlaywrightTimeoutError(f"unexpected selector in test: {selector}")
@@ -69,6 +67,7 @@ def test_send_message_reports_network_error_when_chat_page_never_loads():
     send_btn = MagicMock()
     send_btn.get_attribute.return_value = "/im/convo/-777?sel=-777"
     page.wait_for_selector.side_effect = _no_site_wait_for_selector(send_btn)
+    page.evaluate.return_value = []  # сайта у сообщества нет
 
     calls = {"n": 0}
 
@@ -109,10 +108,8 @@ def test_send_message_skips_group_with_external_site_without_writing():
     # писать, и не открывать чат вовсе, если сайт есть.
     page = MagicMock(url="https://vk.com/some_group")
     page.locator.return_value.count.return_value = 0
-    site_field = MagicMock()
-    site_field.inner_text.return_value = "example.com"
-    page.wait_for_selector.return_value = MagicMock()  # сам факт появления поля
-    page.query_selector.return_value = site_field
+    page.wait_for_selector.return_value = MagicMock()  # кнопка "Написать сообщение" нашлась
+    page.evaluate.return_value = ["example.com"]  # сайт сообщества
 
     adapter = VkSendAdapter(storage_state={})
     with patch("app.adapters.vk.sync_playwright", side_effect=lambda: _fake_playwright_with_page(page)):
@@ -130,14 +127,13 @@ def test_send_message_proceeds_when_group_has_no_site():
     page = MagicMock(url="https://vk.com/some_group")
     page.locator.return_value.count.return_value = 0
     page.inner_text.return_value = "обычный текст страницы, без признаков флуда"
-    page.query_selector.return_value = None  # ни капчи, ни (после таймаута) поля сайта
+    page.query_selector.return_value = None  # капчи нет
+    page.evaluate.return_value = []  # сайта у сообщества нет
 
     send_btn = MagicMock()
     send_btn.get_attribute.return_value = "/im/convo/-777?sel=-777"
 
     def wait_for_selector(selector, timeout=None):
-        if selector == _SITE_FIELD_SELECTOR:
-            raise PlaywrightTimeoutError("site field never appeared")
         if selector == _SEND_MESSAGE_BUTTON_SELECTOR:
             return send_btn
         if selector == _MESSAGE_INPUT_SELECTOR:
@@ -163,13 +159,12 @@ def test_send_message_proceeds_when_site_check_fails_unexpectedly():
     page.locator.return_value.count.return_value = 0
     page.inner_text.return_value = "обычный текст страницы, без признаков флуда"
     page.query_selector.return_value = None
+    page.evaluate.side_effect = RuntimeError("boom")
 
     send_btn = MagicMock()
     send_btn.get_attribute.return_value = "/im/convo/-777?sel=-777"
 
     def wait_for_selector(selector, timeout=None):
-        if selector == _SITE_FIELD_SELECTOR:
-            raise RuntimeError("boom")
         if selector == _SEND_MESSAGE_BUTTON_SELECTOR:
             return send_btn
         if selector == _MESSAGE_INPUT_SELECTOR:

@@ -5,10 +5,12 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
 from app import ratelimit, templating
+from app.adapter_pool import SendAdapterPool
 from app.adapters.registry import get_adapter
 from app.clients.data_service import DataServiceClient
 from app.config import settings
 from app.exceptions import DataServiceError, NoAccountAvailableError
+from app.tasks import campaign_skips_site_check
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,8 @@ def run_followup_task(campaign_id: uuid.UUID) -> None:
     task.status = FollowupTaskStatus.running
 
     client = DataServiceClient()
+    # Тот же пул браузеров на аккаунт, что и в tasks.py::run_send_task.
+    adapters = SendAdapterPool(client, lambda platform, storage_state: get_adapter(platform, storage_state=storage_state))
     try:
         template = _resolve_followup_template(client, campaign_id)
         if template is None:
@@ -69,6 +73,7 @@ def run_followup_task(campaign_id: uuid.UUID) -> None:
             return
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=settings.FOLLOWUP_DELAY_DAYS)
+        skip_site_check = campaign_skips_site_check(client, campaign_id)
 
         offset = 0
         while True:
@@ -80,7 +85,8 @@ def run_followup_task(campaign_id: uuid.UUID) -> None:
             offset += len(leads)
 
             for lead in leads:
-                if not _process_lead(client, task, lead, template, cutoff):
+                lead["skip_site_check"] = skip_site_check
+                if not _process_lead(client, adapters, task, lead, template, cutoff):
                     return  # waiting_for_account — задача останавливается, не ошибка
 
         task.status = FollowupTaskStatus.done
@@ -93,6 +99,7 @@ def run_followup_task(campaign_id: uuid.UUID) -> None:
         task.status = FollowupTaskStatus.failed
         task.error = f"internal error: {exc}"
     finally:
+        adapters.close()
         client.close()
 
 
@@ -105,7 +112,12 @@ def _resolve_followup_template(client: DataServiceClient, campaign_id: uuid.UUID
 
 
 def _process_lead(
-    client: DataServiceClient, task: FollowupTask, lead: dict, template: dict, cutoff: datetime
+    client: DataServiceClient,
+    adapters: SendAdapterPool,
+    task: FollowupTask,
+    lead: dict,
+    template: dict,
+    cutoff: datetime,
 ) -> bool:
     messages = client.list_messages(lead_id=lead["id"])
 
@@ -129,7 +141,7 @@ def _process_lead(
     cooled_down = False
     try:
         try:
-            session = client.get_session(account["id"])
+            adapter = adapters.get(account, lead["platform"])
         except DataServiceError as exc:
             # Та же логика, что и в tasks.py::_process_lead — проблема конкретно этого аккаунта
             # не должна ронять всю задачу, лид просто останется без повтора в этом запуске.
@@ -139,7 +151,6 @@ def _process_lead(
             task.failed += 1
             return True
 
-        adapter = get_adapter(lead["platform"], storage_state=session["storage_state"])
         text = templating.render(template["body"], lead)
         result = adapter.send_message(lead, account, text)
 
@@ -154,6 +165,7 @@ def _process_lead(
                 reason = result.error or ("session_expired" if result.session_expired else "flood_detected")
                 client.cooldown_account(account["id"], minutes=_FLOOD_COOLDOWN_MINUTES, reason=reason)
                 cooled_down = True
+                adapters.discard(account, lead["platform"])
     finally:
         if not cooled_down:
             try:
@@ -161,7 +173,7 @@ def _process_lead(
             except DataServiceError:
                 logger.exception("failed to release account %s", account["id"])
 
-    ratelimit.delay(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC)
+    ratelimit.delay_for_platform(lead["platform"])
     return True
 
 

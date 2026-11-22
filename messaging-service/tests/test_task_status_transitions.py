@@ -537,3 +537,279 @@ def test_send_task_does_not_loop_forever_on_non_flood_failure():
     assert task.sent == 0
     assert leads_route.call_count == 2  # 1-й раз обрабатывает лид, 2-й раз видит его же и останавливается
     assert release_route.called
+
+
+@respx.mock
+def test_send_task_pages_past_full_batch_of_previously_failed_leads():
+    """Регрессия: если первые _BATCH_SIZE лидов status=new все ранее провалились, задача не должна
+    останавливаться — пропущенные лиды остаются в выборке, поэтому нужно листать дальше по offset."""
+    import app.tasks as tasks_module
+
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    failed_ids = [str(uuid.uuid4()) for _ in range(tasks_module._BATCH_SIZE)]
+    fresh = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(uuid.uuid4()),
+                    "lead_id": lead_id,
+                    "account_id": account_id,
+                    "template_variant": "A",
+                    "text_sent": "Hi",
+                    "sent_at": "2026-01-01T00:00:00",
+                    "delivery_status": "failed",
+                    "reply_status": "none",
+                }
+                for lead_id in failed_ids
+            ],
+        )
+    )
+
+    def _leads(request):
+        offset = int(request.url.params["offset"])
+        pool = failed_ids + ([fresh] if not sent else [])
+        return httpx.Response(200, json=[_lead_payload(i) for i in pool[offset : offset + tasks_module._BATCH_SIZE]])
+
+    sent: list[str] = []
+    leads_route = respx.get(f"{BASE}/leads").mock(side_effect=_leads)
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+
+    def _patch(request):
+        sent.append(fresh)
+        return httpx.Response(200, json=_lead_payload(fresh))
+
+    respx.patch(f"{BASE}/leads/{fresh}/status").mock(side_effect=_patch)
+    respx.post(f"{BASE}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": str(uuid.uuid4()),
+                "lead_id": fresh,
+                "account_id": account_id,
+                "template_variant": "A",
+                "text_sent": "Hi Fitness Club",
+                "sent_at": "2026-01-01T00:00:00",
+                "delivery_status": "sent",
+                "reply_status": "none",
+            },
+        )
+    )
+    respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_send_task(uuid.UUID(campaign_id))
+
+    assert task.status == SendTaskStatus.done
+    assert task.sent == 1
+    assert leads_route.call_count == 3  # offset 0 (все провалены) → offset 50 (fresh) → offset 50 (пусто)
+
+@respx.mock
+def test_unreachable_lead_is_skipped_and_rejected_not_counted_as_error(monkeypatch):
+    """Р“СЂСѓРїРїР° СЃРѕ СЃРІРѕРёРј СЃР°Р№С‚РѕРј / Р±РµР· РєРЅРѕРїРєРё "РќР°РїРёСЃР°С‚СЊ" вЂ” СЌС‚Рѕ РЅРµ РѕС€РёР±РєР° РѕС‚РїСЂР°РІРєРё, Р° РїСЂРѕРїСѓСЃРє:
+    Р»РёРґ РїРµСЂРµРІРѕРґРёС‚СЃСЏ РІ rejected, СЃС‡С‘С‚С‡РёРє skipped СЂР°СЃС‚С‘С‚, failed РЅРµ СЂР°СЃС‚С‘С‚, СЃРѕРѕР±С‰РµРЅРёРµ РІ Р‘Р”
+    РЅРµ РїРёС€РµС‚СЃСЏ (РёРЅР°С‡Рµ РїСЂРѕРїСѓСЃРєРё Р¶РіР»Рё Р±С‹ С‡Р°СЃРѕРІРѕР№ Р»РёРјРёС‚ Р°РєРєР°СѓРЅС‚Р°)."""
+    from app.adapters.base import SendResult
+
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    lead1 = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/leads").mock(
+        side_effect=[
+            httpx.Response(200, json=[_lead_payload(lead1)]),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+    rejected_route = respx.patch(f"{BASE}/leads/{lead1}/status").mock(
+        return_value=httpx.Response(200, json=_lead_payload(lead1))
+    )
+    post_message_route = respx.post(f"{BASE}/messages").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    class _UnreachableAdapter:
+        def send_message(self, lead, account, text, image=None):
+            return SendResult(success=False, error="site", has_site=True, unreachable=True)
+
+    monkeypatch.setattr(
+        "app.tasks.get_adapter", lambda platform, storage_state=None: _UnreachableAdapter()
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_send_task(uuid.UUID(campaign_id))
+
+    assert task.status == SendTaskStatus.done
+    assert task.skipped == 1
+    assert task.failed == 0
+    assert task.sent == 0
+    assert rejected_route.called
+    assert post_message_route.call_count == 0
+
+
+@respx.mock
+def test_browser_crash_mid_send_does_not_kill_the_whole_task(monkeypatch):
+    """TargetClosedError (Р·Р°РєСЂС‹Р»Рё РѕРєРЅРѕ Р±СЂР°СѓР·РµСЂР°) СЂР°РЅСЊС€Рµ РІС‹Р»РµС‚Р°Р» РёР· _process_lead Рё СѓР±РёРІР°Р» Р·Р°РґР°С‡Сѓ:
+    РѕСЃС‚Р°РІС€РёРµСЃСЏ Р»РёРґС‹ РґР°Р¶Рµ РЅРµ РїСЂРѕР±РѕРІР°Р»Рё РїРёСЃР°С‚СЊ. РўРµРїРµСЂСЊ СЌС‚Рѕ С‚СЂР°РЅР·РёРµРЅС‚РЅС‹Р№ СЃР±РѕР№ РѕРґРЅРѕРіРѕ Р»РёРґР°."""
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    lead1 = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/leads").mock(
+        side_effect=[
+            httpx.Response(200, json=[_lead_payload(lead1)]),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+    respx.post(f"{BASE}/messages").mock(return_value=httpx.Response(200, json={}))
+    respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    class _CrashingAdapter:
+        def send_message(self, lead, account, text, image=None):
+            raise RuntimeError(
+                "Page.wait_for_selector: Target page, context or browser has been closed"
+            )
+
+    monkeypatch.setattr(
+        "app.tasks.get_adapter", lambda platform, storage_state=None: _CrashingAdapter()
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_send_task(uuid.UUID(campaign_id))
+
+    assert task.status == SendTaskStatus.done  # Р·Р°РґР°С‡Р° РґРѕС€Р»Р° РґРѕ РєРѕРЅС†Р°, Р° РЅРµ СѓРјРµСЂР»Р°
+    assert task.failed == 1  # СЃР±РѕР№ Р·Р°С„РёРєСЃРёСЂРѕРІР°РЅ, РЅРѕ Р»РёРґ РЅРµ "СЃРіРѕСЂРµР»" РЅР°РІСЃРµРіРґР°
+    assert task.sent == 0
+
+
+@respx.mock
+def test_challenge_blocks_run_without_cooldown_or_lead_poisoning(monkeypatch):
+    """РђРЅС‚РёР±РѕС‚-РїСЂРѕРІРµСЂРєР° VK вЂ” РЅРµ С„Р»СѓРґ: РѕСЃС‚Р°РЅР°РІР»РёРІР°РµРј СЂР°СЃСЃС‹Р»РєСѓ СЃ РїРѕРЅСЏС‚РЅРѕР№ РѕС€РёР±РєРѕР№, РЅРѕ Р°РєРєР°СѓРЅС‚
+    РќР• РѕС‚РїСЂР°РІР»СЏРµРј РІ РєСѓР»РґР°СѓРЅ Рё Р»РёРґ РЅРµ РїРѕРјРµС‡Р°РµРј, С‡С‚РѕР±С‹ РїРѕСЃР»Рµ РїСЂРѕС…РѕР¶РґРµРЅРёСЏ РїСЂРѕРІРµСЂРєРё РІСЃС‘ РїСЂРѕРґРѕР»Р¶РёР»РѕСЃСЊ."""
+    from app.adapters.base import SendResult
+
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    lead1 = str(uuid.uuid4())
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/leads").mock(
+        side_effect=[
+            httpx.Response(200, json=[_lead_payload(lead1)]),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+    cooldown_route = respx.post(f"{BASE}/accounts/{account_id}/cooldown").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="cooldown"))
+    )
+    release_route = respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+    patch_route = respx.patch(f"{BASE}/leads/{lead1}/status").mock(
+        return_value=httpx.Response(200, json=_lead_payload(lead1))
+    )
+    put_session_route = respx.put(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200, json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"}
+        )
+    )
+
+    class _ChallengeAdapter:
+        challenge_passed = True  # человек прошёл проверку в видимом браузере
+
+        def storage_state(self):
+            return {"cookies": [], "origins": []}
+
+        def send_message(self, lead, account, text, image=None):
+            return SendResult(success=False, blocked=True, error="VK anti-bot challenge")
+
+    monkeypatch.setattr(
+        "app.tasks.get_adapter", lambda platform, storage_state=None: _ChallengeAdapter()
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_send_task(uuid.UUID(campaign_id))
+
+    assert task.status == SendTaskStatus.failed
+    assert task.error == "VK anti-bot challenge"
+    assert not cooldown_route.called
+    assert not patch_route.called
+    assert release_route.called
+    assert put_session_route.called  # обновлённая после проверки сессия сохранена
+

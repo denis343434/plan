@@ -68,11 +68,16 @@ def run_campaign_flow(campaign_id: uuid.UUID, max_groups: int | None = None) -> 
 
         task.phase = OrchestrationPhase.parsing
         task.progress = None
+        # parse_params (город/каналы у yandex_maps) уходят в filters парсера как есть — сам
+        # Оркестратор их не интерпретирует.
+        filters = dict(campaign.get("parse_params") or {})
+        if max_groups is not None:
+            filters["max_groups"] = max_groups
         parse_task = parser_client.start_parse(
             platform=campaign["platform"],
             keyword=campaign["keyword"],
             campaign_id=campaign_id,
-            filters={"max_groups": max_groups} if max_groups is not None else None,
+            filters=filters or None,
             # По умолчанию True — для кампаний, созданных до появления этого поля в Data Service.
             use_account=campaign.get("use_account", True),
         )

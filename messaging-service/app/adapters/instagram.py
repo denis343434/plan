@@ -1,12 +1,12 @@
 import logging
-import random
 import re
-import time
 from typing import Callable
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from app import ratelimit
 from app.adapters.base import ReplyCheckResult, SendResult, SessionExpiredError
+from app.adapters.browser_session import PersistentBrowserMixin
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -94,10 +94,6 @@ def _block_heavy_resources(context) -> None:
     context.route("**/*", handler)
 
 
-def _sleep_random() -> None:
-    time.sleep(random.uniform(settings.IG_MIN_DELAY_SEC, settings.IG_MAX_DELAY_SEC))
-
-
 class _PageLoadError(Exception):
     """page.goto сам не смог загрузить страницу — сбой транспорта, не признак того, что этому
     лиду нельзя написать. Тот же принцип, что и messaging-service/app/adapters/vk.py::_PageLoadError."""
@@ -110,73 +106,81 @@ def _goto_or_raise(page: Page, url: str) -> None:
         raise _PageLoadError(str(exc)) from exc
 
 
-class InstagramSendAdapter:
+class InstagramSendAdapter(PersistentBrowserMixin):
     def __init__(self, storage_state: dict) -> None:
         self._storage_state = storage_state
 
-    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=settings.IG_HEADLESS)
+    def _playwright_factory(self):
+        return sync_playwright()
+
+    def _launch(self, pw):
+        browser = pw.chromium.launch(headless=settings.IG_HEADLESS)
+        try:
             context = browser.new_context(storage_state=self._storage_state or None)
             _block_heavy_resources(context)
-            page = context.new_page()
+        except BaseException:
+            browser.close()
+            raise
+        return browser, context
+
+    def send_message(self, lead: dict, account: dict, text: str, image: dict | None = None) -> SendResult:
+        return self._with_page(lambda page: self._send_on_page(page, lead, text, image))
+
+    def _send_on_page(self, page: Page, lead: dict, text: str, image: dict | None) -> SendResult:
+        try:
+            _goto_or_raise(page, lead["group_url"])
+            _dismiss_continue_splash(page)
+
             try:
-                _goto_or_raise(page, lead["group_url"])
-                _dismiss_continue_splash(page)
+                message_btn = page.wait_for_selector(_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                _raise_if_login_required(page)
+                return SendResult(
+                    success=False,
+                    error="у профиля недоступна кнопка «Message» — либо приём сообщений отключён, "
+                    "либо страница не успела прогрузиться",
+                )
 
-                try:
-                    message_btn = page.wait_for_selector(_MESSAGE_BUTTON_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    _raise_if_login_required(page)
-                    return SendResult(
-                        success=False,
-                        error="у профиля недоступна кнопка «Message» — либо приём сообщений отключён, "
-                        "либо страница не успела прогрузиться",
-                    )
+            message_btn.click()
+            ratelimit.settle()
 
-                message_btn.click()
-                _sleep_random()
+            flood = self._detect_flood(page)
+            if flood is not None:
+                return SendResult(success=False, error=flood, flood_detected=True)
 
-                flood = self._detect_flood(page)
-                if flood is not None:
-                    return SendResult(success=False, error=flood, flood_detected=True)
+            try:
+                page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return SendResult(
+                    success=False,
+                    error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер Instagram)",
+                )
 
-                try:
-                    page.wait_for_selector(_MESSAGE_INPUT_SELECTOR, timeout=_SLOW_RENDER_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    return SendResult(
-                        success=False,
-                        error="чат открылся, но поле ввода сообщения не появилось за 40с (медленный рендер Instagram)",
-                    )
+            if image is not None:
+                logger.warning(
+                    "InstagramSendAdapter: image attachment requested but not implemented for lead %s",
+                    lead.get("id"),
+                )
 
-                if image is not None:
-                    logger.warning(
-                        "InstagramSendAdapter: image attachment requested but not implemented for lead %s",
-                        lead.get("id"),
-                    )
+            page.click(_MESSAGE_INPUT_SELECTOR)
+            ratelimit.settle()
+            self._type_like_human(page, text)
+            page.keyboard.press("Enter")
+            ratelimit.settle()
 
-                page.click(_MESSAGE_INPUT_SELECTOR)
-                _sleep_random()
-                self._type_like_human(page, text)
-                page.keyboard.press("Enter")
-                _sleep_random()
+            flood = self._detect_flood(page)
+            if flood is not None:
+                return SendResult(success=False, error=flood, flood_detected=True)
 
-                flood = self._detect_flood(page)
-                if flood is not None:
-                    return SendResult(success=False, error=flood, flood_detected=True)
-
-                return SendResult(success=True)
-            except _PageLoadError as exc:
-                logger.warning("failed to load Instagram page for lead %s, will retry: %s", lead.get("id"), exc)
-                return SendResult(success=False, error=str(exc), network_error=True)
-            except SessionExpiredError as exc:
-                return SendResult(success=False, error=str(exc), session_expired=True)
-            except Exception as exc:  # unexpected Playwright/DOM failure — reported as a delivery failure
-                logger.exception("instagram send failed for lead %s", lead.get("id"))
-                return SendResult(success=False, error=str(exc))
-            finally:
-                context.close()
-                browser.close()
+            return SendResult(success=True)
+        except _PageLoadError as exc:
+            logger.warning("failed to load Instagram page for lead %s, will retry: %s", lead.get("id"), exc)
+            return SendResult(success=False, error=str(exc), network_error=True)
+        except SessionExpiredError as exc:
+            return SendResult(success=False, error=str(exc), session_expired=True)
+        except Exception as exc:  # unexpected Playwright/DOM failure — reported as a delivery failure
+            logger.exception("instagram send failed for lead %s", lead.get("id"))
+            return SendResult(success=False, error=str(exc))
 
     def _detect_flood(self, page: Page) -> str | None:
         content = page.inner_text("body").lower()
@@ -186,8 +190,9 @@ class InstagramSendAdapter:
         return None
 
     def _type_like_human(self, page: Page, text: str) -> None:
-        for char in text:
-            page.type(_MESSAGE_INPUT_SELECTOR, char, delay=random.uniform(30, 120))
+        # По словам, а не по символу — см. VkSendAdapter._type_like_human.
+        for chunk in ratelimit.type_chunks(text):
+            page.type(_MESSAGE_INPUT_SELECTOR, chunk, delay=ratelimit.typing_delay_ms())
 
 
 class InstagramInboxAdapter:

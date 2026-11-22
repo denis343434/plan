@@ -5,6 +5,15 @@ class Platform(StrEnum):
     vk = "vk"
     tg = "tg"
     instagram = "instagram"
+    whatsapp = "whatsapp"
+    # Пока только аккаунт с сохранённой сессией — ни парсера, ни отправки под него ещё нет.
+    facebook = "facebook"
+    # Только у кампаний, не у лидов/аккаунтов: источник — Яндекс Карты, а найденные лиды
+    # пишутся с платформой канала связи организации (vk/tg/whatsapp), см.
+    # parser-service/app/adapters/yandex_maps.py.
+    yandex_maps = "yandex_maps"
+    # То же для Google Карт (parser-service/app/adapters/google_maps.py).
+    google_maps = "google_maps"
 
 
 class LeadStatus(StrEnum):

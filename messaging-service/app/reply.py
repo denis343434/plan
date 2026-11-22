@@ -3,7 +3,6 @@ import logging
 from app import ratelimit
 from app.adapters.registry import get_adapter
 from app.clients.data_service import DataServiceClient
-from app.config import settings
 from app.exceptions import DataServiceError
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ def send_reply(lead_id: str, account_id: str, text: str, image: dict | None = No
                 except DataServiceError:
                     logger.exception("failed to release account %s", account_id)
 
-        ratelimit.delay(settings.MIN_DELAY_SEC, settings.MAX_DELAY_SEC)
+        ratelimit.delay_for_platform(lead["platform"])
         return message
     finally:
         client.close()

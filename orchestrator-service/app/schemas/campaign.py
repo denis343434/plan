@@ -9,6 +9,8 @@ class CampaignCreate(BaseModel):
     keyword: str
     template_id: UUID | None = None
     use_account: bool = True
+    # Параметры источника (город/каналы для yandex_maps) — см. Campaign.parse_params в Data Service.
+    parse_params: dict | None = None
 
 
 class CampaignStartResponse(BaseModel):

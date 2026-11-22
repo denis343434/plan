@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.exceptions import NoAccountAvailableError, NotFoundError
-from app.routers import accounts, campaigns, leads, messages, templates
+from app.routers import accounts, campaigns, leads, messages, stats, templates
 
 app = FastAPI(title="Data Service")
 
@@ -19,6 +19,7 @@ app.include_router(accounts.router)
 app.include_router(messages.router)
 app.include_router(campaigns.router)
 app.include_router(templates.router)
+app.include_router(stats.router)
 
 
 @app.exception_handler(NotFoundError)
