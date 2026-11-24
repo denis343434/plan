@@ -813,3 +813,83 @@ def test_challenge_blocks_run_without_cooldown_or_lead_poisoning(monkeypatch):
     assert release_route.called
     assert put_session_route.called  # обновлённая после проверки сессия сохранена
 
+
+@respx.mock
+def test_unreachable_lead_does_not_shift_offset_for_remaining_leads(monkeypatch):
+    """Регрессия: rejected-лид (невалидный номер в WhatsApp / группа с сайтом в VK) исчезает
+    из выборки status=new, поэтому offset пагинации не должен сдвигаться на него — иначе
+    следующий обычный лид пропускается. Особенно заметно на кампаниях по Яндекс.Картам, где
+    невалидных номеров много."""
+    import app.tasks as tasks_module
+    from app.adapters.base import SendResult
+
+    campaign_id = str(uuid.uuid4())
+    template_id = str(uuid.uuid4())
+    account_id = str(uuid.uuid4())
+    unreachable, sent_lead, after = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+
+    monkeypatch.setattr(tasks_module, "_BATCH_SIZE", 2)
+
+    respx.get(f"{BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, template_id))
+    )
+    respx.get(f"{BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{BASE}/templates/{template_id}").mock(
+        return_value=httpx.Response(200, json=_template_payload(template_id, campaign_id))
+    )
+    respx.get(f"{BASE}/messages").mock(return_value=httpx.Response(200, json=[]))
+
+    # Имитируем Data Service: обработанные лиды (contacted/rejected) пропадают из status=new.
+    remaining = [unreachable, sent_lead, after]
+
+    def _leads(request):
+        offset = int(request.url.params["offset"])
+        return httpx.Response(
+            200,
+            json=[_lead_payload(lead_id) for lead_id in remaining[offset : offset + tasks_module._BATCH_SIZE]],
+        )
+
+    leads_route = respx.get(f"{BASE}/leads").mock(side_effect=_leads)
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+
+    def _patch(request):
+        lead_id = request.url.path.split("/")[-2]
+        if lead_id in remaining:
+            remaining.remove(lead_id)
+        return httpx.Response(200, json=_lead_payload(lead_id))
+
+    for lead_id in (unreachable, sent_lead, after):
+        respx.patch(f"{BASE}/leads/{lead_id}/status").mock(side_effect=_patch)
+    post_message_route = respx.post(f"{BASE}/messages").mock(return_value=httpx.Response(200, json={}))
+    respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    class _MixedAdapter:
+        def send_message(self, lead, account, text, image=None):
+            if lead["id"] == unreachable:
+                return SendResult(success=False, error="номер не найден", unreachable=True)
+            return SendResult(success=True)
+
+    monkeypatch.setattr(
+        tasks_module, "get_adapter", lambda platform, storage_state=None: _MixedAdapter()
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_send_task(uuid.UUID(campaign_id))
+
+    assert task.status == SendTaskStatus.done
+    assert task.skipped == 1
+    assert task.sent == 2  # sent_lead и after — after не пропущен из-за сдвига offset
+    assert leads_route.call_count == 3
+    assert [call.request.url.params["offset"] for call in leads_route.calls] == ["0", "0", "0"]
+    assert post_message_route.call_count == 2
+

@@ -39,11 +39,30 @@ class DataServiceClient:
     def bulk_insert_leads(self, leads: list[dict]) -> dict:
         return self._request("POST", "/leads/bulk", json=leads).json()
 
-    def list_leads(self, platform: str | None = None, limit: int = 5000) -> list[dict]:
-        params: dict[str, Any] = {"limit": limit}
-        if platform is not None:
-            params["platform"] = platform
-        return self._request("GET", "/leads", params=params).json()
+    # Размер страницы при чтении всего списка лидов. Раньше здесь был один запрос с limit=5000,
+    # и всё, что новее этих 5000 (Data Service отдаёт по found_at по возрастанию), в dedup не
+    # попадало. На кампании "Строительство домов" это выглядело так: парсер снова проверял уже
+    # найденные им же группы, показывал "подходит: 19", а bulk-вставка молча пропускала 18 из них
+    # как дубликаты — в кампании появлялась одна новая группа (см. _LEADS_PAGE_SIZE).
+    _LEADS_PAGE_SIZE = 1000
+
+    def list_leads(self, platform: str | None = None) -> list[dict]:
+        """Весь список лидов (по платформе или всех), постранично.
+
+        Dedup в run_parse_task должен знать ВСЕ уже известные external_id: иначе парсер заново
+        обрабатывает свои же старые группы, тратя на каждую загрузку карточки и проверку сайта,
+        а результат (found) оказывается больше, чем реально вставлено (inserted)."""
+        leads: list[dict] = []
+        offset = 0
+        while True:
+            params: dict[str, Any] = {"limit": self._LEADS_PAGE_SIZE, "offset": offset}
+            if platform is not None:
+                params["platform"] = platform
+            page = self._request("GET", "/leads", params=params).json()
+            leads.extend(page)
+            if len(page) < self._LEADS_PAGE_SIZE:
+                return leads
+            offset += self._LEADS_PAGE_SIZE
 
     def next_available_account(
         self,

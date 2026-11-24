@@ -73,7 +73,12 @@ def run_parse_task(
     # Аккаунты Instagram/Facebook, занятые под поиск организаций Google Карт (см. _lock_social_accounts).
     social_account_ids: list[str] = []
     try:
-        parse_filters = ParseFilters(has_site=filters.has_site, max_groups=filters.max_groups, city=filters.city)
+        parse_filters = ParseFilters(
+            has_site=filters.has_site,
+            max_groups=filters.max_groups,
+            city=filters.city,
+            country=filters.country,
+        )
         if filters.channels:
             parse_filters.channels = tuple(c for c in filters.channels if c in contacts.CHANNELS)
         parse_filters.whatsapp_by_phone = filters.whatsapp_by_phone

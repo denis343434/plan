@@ -70,7 +70,10 @@ def list_leads(
         stmt = stmt.where(Lead.platform == platform)
     if campaign_id is not None:
         stmt = stmt.where(Lead.campaign_id == campaign_id)
-    stmt = stmt.order_by(Lead.found_at).limit(limit).offset(offset)
+    # Вторичный ключ по id — чтобы постраничное чтение (parser-service собирает по нему весь
+    # dedup-список) было стабильным: у лидов одной bulk-вставки found_at совпадает до микросекунды,
+    # и без однозначного порядка Postgres может отдать такую строку дважды или пропустить.
+    stmt = stmt.order_by(Lead.found_at, Lead.id).limit(limit).offset(offset)
     return list(db.execute(stmt).scalars().all())
 
 

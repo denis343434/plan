@@ -26,14 +26,17 @@ def create_campaign(payload: CampaignCreate) -> dict:
 
 @router.post("/{campaign_id}/start", status_code=202, response_model=CampaignStartResponse)
 def start_campaign(
-    campaign_id: UUID, background_tasks: BackgroundTasks, max_groups: int | None = None
+    campaign_id: UUID,
+    background_tasks: BackgroundTasks,
+    max_groups: int | None = None,
+    parse_only: bool = False,
 ) -> CampaignStartResponse:
     existing = get_task(campaign_id)
     if existing is not None and existing.phase in _IN_PROGRESS_PHASES:
         return CampaignStartResponse(campaign_id=campaign_id, phase=existing.phase)
 
     task = create_task(campaign_id)
-    background_tasks.add_task(run_campaign_flow, campaign_id, max_groups)
+    background_tasks.add_task(run_campaign_flow, campaign_id, max_groups, parse_only)
     return CampaignStartResponse(campaign_id=campaign_id, phase=task.phase)
 
 

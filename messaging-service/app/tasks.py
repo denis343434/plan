@@ -21,6 +21,7 @@ class SendTaskStatus(StrEnum):
     queued = "queued"
     running = "running"
     done = "done"
+    stopped = "stopped"
     waiting_for_account = "waiting_for_account"
     failed = "failed"
 
@@ -33,6 +34,13 @@ class SendTask:
     failed: int = 0
     skipped: int = 0
     error: str | None = None
+    # Кнопка «Стоп» в GUI: задача останавливается после текущего лида (не обрываем уже
+    # начатую отправку/набор текста), следующие лиды в этом прогоне не берутся.
+    stop_requested: bool = False
+    # Причина последнего сбоя аккаунта (например, протухшая сессия WhatsApp). Если после неё
+    # свободных аккаунтов не осталось, статус становится waiting_for_account, и эту причину
+    # нужно показать пользователю — иначе «нажал рассылку и ничего не происходит».
+    last_error: str | None = None
     # Лиды, у которых отправка провалилась без признаков флуда (не аккаунт виноват, а сам
     # лид/сообщение) — остаются status=new в Data Service (ретраятся в следующем запуске
     # кампании), но в рамках ЭТОГО запуска повторно не берутся, иначе цикл ниже никогда
@@ -85,6 +93,9 @@ def run_send_task(campaign_id: uuid.UUID, retry_failed: bool = False) -> None:
         # что новых лидов нет, и остальные (за пределами первых _BATCH_SIZE) не писались никогда.
         offset = 0
         while True:
+            if task.stop_requested:
+                task.status = SendTaskStatus.stopped
+                return
             fetched = client.list_leads(
                 status="new", campaign_id=campaign_id, limit=_BATCH_SIZE, offset=offset
             )
@@ -98,6 +109,9 @@ def run_send_task(campaign_id: uuid.UUID, retry_failed: bool = False) -> None:
                 break
 
             for lead in leads:
+                if task.stop_requested:
+                    task.status = SendTaskStatus.stopped
+                    return
                 lead["skip_site_check"] = skip_site_check
                 if not _process_lead(client, adapters, task, lead, templates):
                     return  # waiting_for_account — задача останавливается, не ошибка
@@ -108,7 +122,7 @@ def run_send_task(campaign_id: uuid.UUID, retry_failed: bool = False) -> None:
                 or lead["id"] in previously_failed_lead_ids
             )
 
-        task.status = SendTaskStatus.done
+        task.status = SendTaskStatus.stopped if task.stop_requested else SendTaskStatus.done
 
     except DataServiceError as exc:
         task.status = SendTaskStatus.failed
@@ -153,11 +167,16 @@ def _resolve_templates(client: DataServiceClient, campaign_id: uuid.UUID) -> lis
 def _process_lead(
     client: DataServiceClient, adapters: SendAdapterPool, task: SendTask, lead: dict, templates: list[dict]
 ) -> bool:
+    # Начало цикла ЭТОГО лида — от него ratelimit считает, сколько ещё спать до случайной цели
+    # 110-125с (см. WA_CYCLE_MIN_SEC/MAX), чтобы время отправки не добавлялось сверху.
+    cycle_started = time.monotonic()
     # Аккаунт может быть временно занят (параллельный парсинг/другой прогон) — несколько коротких
     # повторов вместо мгновенного "waiting_for_account", из-за которого рассылка вставала на
     # первом же лиде (см. кампанию "Строительство домов": 16 попыток и стоп).
     account = None
     for attempt in range(3):
+        if task.stop_requested:
+            return True
         try:
             account = client.next_available_account(
                 platform=lead["platform"], purpose="messaging", task_ref=str(task.campaign_id)
@@ -166,11 +185,19 @@ def _process_lead(
         except NoAccountAvailableError as exc:
             if attempt == 2:
                 task.status = SendTaskStatus.waiting_for_account
+                # Если только что был сбой конкретного аккаунта (сессия/флуд), показываем именно
+                # его — это полезнее, чем общее «нет аккаунта».
+                task.error = task.last_error or f"нет свободного аккаунта для платформы {lead['platform']}"
                 logger.warning("no account available for lead %s: %s", lead["id"], exc)
                 return False
             time.sleep(5)
 
     cooled_down = False
+    # Пауза между лидами — это защита от флуда, а не ритуал: если сообщение вообще не
+    # отправлялось (номер не в WhatsApp / у сообщества есть сайт), лимит аккаунта не потрачен,
+    # и выжидать 85-95с (WhatsApp) нечего. Раньше такие лиды съедали полную паузу, из-за чего
+    # кампания по Яндекс.Картам с заметной долей невалидных номеров шла в разы дольше.
+    should_pause = True
     adapter = None
     try:
         try:
@@ -181,6 +208,7 @@ def _process_lead(
             # рассылку для остальных, рабочих. Лид остаётся status=new и ретраится в следующем
             # запуске кампании — как и любая другая непроблема-лида ошибка отправки ниже.
             logger.warning("account %s unusable for lead %s (%s), skipping this attempt", account["id"], lead["id"], exc)
+            task.last_error = f"аккаунт «{account.get('login') or account['id']}» непригоден: {exc}"
             task.failed += 1
             task.permanently_failed_lead_ids.add(lead["id"])
             return True
@@ -216,8 +244,12 @@ def _process_lead(
             # rejected, чтобы он не висел вечно в "новых" и не пробовался каждый прогон.
             logger.info("lead %s unreachable, marking rejected: %s", lead["id"], result.error)
             client.patch_lead_status(lead["id"], "rejected")
-            task.permanently_failed_lead_ids.add(lead["id"])
             task.skipped += 1
+            should_pause = False
+            # В permanently_failed_lead_ids НЕ добавляем: rejected-лид уже исчез из выборки
+            # status=new, а этот set ниже сдвигает offset пагинации (лиды, которые остались
+            # new). Иначе каждый невалидный номер/группа с сайтом сдвигали бы offset и
+            # следующий обычный лид пропускался бы. Регрессия особенно заметна на Яндекс.Картах.
         else:
             # network_error — страница не загрузилась (плохой интернет), не проблема лида: пишем
             # "pending", а не "failed" — previously_failed_lead_ids выше фильтрует только по
@@ -230,6 +262,7 @@ def _process_lead(
             task.failed += 1
             if result.flood_detected or result.session_expired:
                 reason = result.error or ("session_expired" if result.session_expired else "flood_detected")
+                task.last_error = f"аккаунт «{account.get('login') or account['id']}»: {reason}"
                 client.cooldown_account(account["id"], minutes=_FLOOD_COOLDOWN_MINUTES, reason=reason)
                 cooled_down = True
                 adapters.discard(account, lead["platform"])
@@ -257,8 +290,14 @@ def _process_lead(
                 logger.exception("failed to release account %s", account["id"])
 
     # Единственная пауза между лидами — внутри send_message адаптеров остались только короткие
-    # "дать странице устояться" (см. SEND_SETTLE_*_SEC в config.py).
-    ratelimit.delay_for_platform(lead["platform"])
+    # "дать странице устояться" (см. SEND_SETTLE_*_SEC в config.py). Пропуски (unreachable/
+    # has_site) её не платят: сообщение не уходило, лимит аккаунта не тронут (см. should_pause).
+    if should_pause:
+        ratelimit.delay_for_platform(
+            lead["platform"],
+            should_stop=lambda: task.stop_requested,
+            elapsed_sec=time.monotonic() - cycle_started,
+        )
     return True
 
 

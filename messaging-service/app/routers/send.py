@@ -30,6 +30,23 @@ def start_send(campaign_id: UUID, background_tasks: BackgroundTasks, retry_faile
     return _to_out(task)
 
 
+@router.post("/{campaign_id}/stop", response_model=SendStatusOut)
+def stop_send(campaign_id: UUID) -> SendStatusOut:
+    """Кнопка «Стоп»: останавливает текущую рассылку после текущего лида.
+
+    Уже начатую отправку/набор текста не обрываем (это может оставить WhatsApp в странном
+    состоянии) — задача завершит текущего лида и не возьмёт следующих.
+    """
+    task = get_task(campaign_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"send task for campaign {campaign_id} not found")
+    if task.status in (SendTaskStatus.queued, SendTaskStatus.running, SendTaskStatus.waiting_for_account):
+        task.stop_requested = True
+        if task.status in (SendTaskStatus.queued, SendTaskStatus.waiting_for_account):
+            task.status = SendTaskStatus.stopped
+    return _to_out(task)
+
+
 @router.get("/{campaign_id}/send-status", response_model=SendStatusOut)
 def send_status(campaign_id: UUID) -> SendStatusOut:
     task = get_task(campaign_id)

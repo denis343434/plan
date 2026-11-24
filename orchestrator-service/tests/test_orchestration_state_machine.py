@@ -74,6 +74,77 @@ def test_flow_completes_through_parsing_and_messaging():
 
 
 @respx.mock
+def test_flow_completes_when_user_stops_messaging_from_gui():
+    """«Стоп» в GUI: Messaging Service отдаёт status=stopped, Orchestrator не считает это сбоем."""
+    campaign_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+
+    respx.get(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id))
+    )
+    patch_route = respx.patch(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, status="paused"))
+    )
+    respx.post(f"{PARSER_BASE}/parse").mock(
+        return_value=httpx.Response(202, json=_parse_status(task_id, "queued"))
+    )
+    respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
+        return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
+    )
+    _mock_template(campaign_id)
+    respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send").mock(
+        return_value=httpx.Response(202, json=_send_status(campaign_id, "queued"))
+    )
+    respx.get(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send-status").mock(
+        return_value=httpx.Response(200, json=_send_status(campaign_id, "stopped"))
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_campaign_flow(uuid.UUID(campaign_id))
+
+    assert task.phase == OrchestrationPhase.done
+    assert task.error is None
+    assert task.note and "остановлена" in task.note
+    assert patch_route.call_count == 2  # running, then paused
+
+
+@respx.mock
+def test_flow_parse_only_skips_messaging_even_with_template():
+    """«Запустить только парсер»: шаблон есть, но рассылка всё равно не должна стартовать."""
+    campaign_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+
+    respx.get(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id))
+    )
+    patch_route = respx.patch(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, status="completed"))
+    )
+    respx.post(f"{PARSER_BASE}/parse").mock(
+        return_value=httpx.Response(202, json=_parse_status(task_id, "queued"))
+    )
+    respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
+        return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
+    )
+    _mock_template(campaign_id)
+    send_route = respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send")
+    # Шаблоны при parse_only вообще не должны запрашиваться — до стадии рассылки не доходим.
+    templates_route = respx.get(f"{DATA_BASE}/templates").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_campaign_flow(uuid.UUID(campaign_id), parse_only=True)
+
+    assert task.phase == OrchestrationPhase.done
+    assert task.error is None
+    assert task.note and "только парсинг" in task.note
+    assert not send_route.called
+    assert not templates_route.called
+    assert patch_route.call_count == 2  # running, then completed
+
+
+@respx.mock
 def test_flow_skips_messaging_when_no_template_configured():
     campaign_id = str(uuid.uuid4())
     task_id = str(uuid.uuid4())
@@ -91,6 +162,42 @@ def test_flow_skips_messaging_when_no_template_configured():
         return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
     )
     respx.get(f"{DATA_BASE}/templates").mock(return_value=httpx.Response(200, json=[]))
+    send_route = respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send")
+
+    task = create_task(uuid.UUID(campaign_id))
+    run_campaign_flow(uuid.UUID(campaign_id))
+
+    assert task.phase == OrchestrationPhase.done
+    assert task.error is None
+    assert task.note and "шаблон" in task.note
+    assert not send_route.called
+    assert patch_route.call_count == 2  # running, then completed
+
+
+@respx.mock
+def test_flow_skips_messaging_when_only_followup_template_exists():
+    campaign_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
+
+    respx.get(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id))
+    )
+    patch_route = respx.patch(f"{DATA_BASE}/campaigns/{campaign_id}").mock(
+        return_value=httpx.Response(200, json=_campaign_payload(campaign_id, status="completed"))
+    )
+    respx.post(f"{PARSER_BASE}/parse").mock(
+        return_value=httpx.Response(202, json=_parse_status(task_id, "queued"))
+    )
+    respx.get(f"{PARSER_BASE}/parse/{task_id}/status").mock(
+        return_value=httpx.Response(200, json=_parse_status(task_id, "done"))
+    )
+    # F — повторное сообщение; без A/B первые сообщения отправлять нечем.
+    respx.get(f"{DATA_BASE}/templates").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"id": str(uuid.uuid4()), "campaign_id": campaign_id, "variant": "F", "body": "hi"}],
+        )
+    )
     send_route = respx.post(f"{MESSAGING_BASE}/campaigns/{campaign_id}/send")
 
     task = create_task(uuid.UUID(campaign_id))

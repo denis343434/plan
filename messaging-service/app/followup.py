@@ -1,4 +1,5 @@
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -119,6 +120,7 @@ def _process_lead(
     template: dict,
     cutoff: datetime,
 ) -> bool:
+    cycle_started = time.monotonic()
     messages = client.list_messages(lead_id=lead["id"])
 
     if any(m["template_variant"] == templating.FOLLOWUP_VARIANT for m in messages):
@@ -173,7 +175,9 @@ def _process_lead(
             except DataServiceError:
                 logger.exception("failed to release account %s", account["id"])
 
-    ratelimit.delay_for_platform(lead["platform"])
+    ratelimit.delay_for_platform(
+        lead["platform"], elapsed_sec=time.monotonic() - cycle_started
+    )
     return True
 
 

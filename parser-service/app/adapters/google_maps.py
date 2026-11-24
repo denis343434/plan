@@ -301,7 +301,7 @@ class GoogleMapsAdapter:
         phone = phone_id.removeprefix("phone:tel:") or None
         found = contacts.channel_leads(hrefs)
         digits = contacts.phone_digits(phone)
-        if filters.whatsapp_by_phone and "whatsapp" not in found and contacts.is_ru_mobile(digits):
+        if filters.whatsapp_by_phone and "whatsapp" not in found and contacts.is_mobile_for_whatsapp(digits):
             found["whatsapp"] = contacts.whatsapp_lead_from_phone(digits)
 
         address = self._address(page)

@@ -16,6 +16,10 @@ def get_adapter(platform: str, storage_state: dict | None = None) -> SendAdapter
         from app.adapters.web_messenger import TelegramSendAdapter  # lazy: same reason as VK above
 
         return TelegramSendAdapter(storage_state or {})
+    if platform == "whatsapp" and settings.WA_ADAPTER_MODE == "desktop":
+        from app.adapters.whatsapp_desktop import WhatsAppDesktopAdapter  # lazy: only Windows
+
+        return WhatsAppDesktopAdapter(storage_state or {})
     if platform == "whatsapp" and settings.WA_ADAPTER_MODE == "playwright":
         from app.adapters.web_messenger import WhatsAppSendAdapter  # lazy: same reason as VK above
 

@@ -27,8 +27,9 @@ class Campaign(UUIDPK, Base):
     # запуска парсинга, на отправку сообщений (которая аккаунт требует всегда) не влияет.
     use_account: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     # Доп. параметры парсинга, специфичные для источника — сейчас только у yandex_maps:
-    # {"city": "Казань", "channels": ["vk", "tg", "whatsapp"], "has_site": false}. Передаётся
-    # Оркестратором в filters парсера как есть (см. orchestrator-service/app/orchestration.py).
+    # {"city": "Алматы", "country": "Казахстан", "channels": ["vk", "tg", "whatsapp"],
+    # "has_site": false}. country может отсутствовать (старые кампании и Google Карты).
+    # Передаётся Оркестратором в filters парсера как есть (см. orchestrator-service/app/orchestration.py).
     parse_params: Mapped[dict | None] = mapped_column(JSON, default=None)
     status: Mapped[str] = mapped_column(nullable=False, default="draft", server_default="draft")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

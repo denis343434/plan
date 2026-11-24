@@ -91,6 +91,16 @@ def _sleep_random() -> None:
     time.sleep(random.uniform(settings.YANDEX_MIN_DELAY_SEC, settings.YANDEX_MAX_DELAY_SEC))
 
 
+def _search_query(keyword: str, filters: ParseFilters) -> str:
+    """«кафе Алматы Казахстан»: страна уточняет город, когда он есть в нескольких странах.
+
+    Проверено вживую 2026-11-22: Яндекс корректно переходит в регион по такому запросу
+    (Минск → /157/minsk/, Алматы → /162/almaty/), а без страны «кафе Берлин» он может принять
+    город за название организации. Пустые части (старые кампании без страны) пропускаем.
+    """
+    return " ".join(part.strip() for part in (keyword, filters.city, filters.country) if part and part.strip())
+
+
 class YandexMapsAdapter:
     def search_communities(
         self,
@@ -98,7 +108,7 @@ class YandexMapsAdapter:
         filters: ParseFilters,
         on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
-        query = f"{keyword} {filters.city}".strip() if filters.city else keyword
+        query = _search_query(keyword, filters)
         leads: list[RawLead] = []
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
@@ -232,16 +242,50 @@ class YandexMapsAdapter:
         found = contacts.channel_leads(hrefs)
         if filters.whatsapp_by_phone and "whatsapp" not in found:
             digits = contacts.phone_digits(phone)
-            if contacts.is_ru_mobile(digits):
+            if contacts.is_mobile_for_whatsapp(digits):
                 found["whatsapp"] = contacts.whatsapp_lead_from_phone(digits)
 
         lead = contacts.pick_lead(found, filters.channels, known)
         if lead is None:
+            self._log_skipped_card(org_url, snippet_title, found, filters, known, phone)
             return None
 
         lead.title = snippet_title or self._text(page, _CARD_TITLE_SELECTOR)
         lead.admin_contact = _contact_summary(phone, self._text(page, _ADDRESS_SELECTOR), site, org_url)
         return lead
+
+    @staticmethod
+    def _log_skipped_card(
+        org_url: str,
+        title: str | None,
+        found: dict[str, RawLead],
+        filters: ParseFilters,
+        known: frozenset[str],
+        phone: str | None,
+    ) -> None:
+        """Пишет в лог, почему карточка с WhatsApp/мобильным телефоном не стала лидом.
+
+        Без этого «не взял организацию с одним WhatsApp» выглядело одинаково для трёх разных
+        случаев: номер уже есть у другого лида (дубль контакта), телефон не выглядит мобильным,
+        или канал не выбран в приоритете."""
+        digits = contacts.phone_digits(phone)
+        has_wa = "whatsapp" in found
+        phone_only_possible = not has_wa and contacts.is_mobile_for_whatsapp(digits)
+        if not has_wa and not phone_only_possible:
+            return  # карточка вообще не про WhatsApp — не засоряем лог
+
+        known_channels = [ch for ch, lead in found.items() if f"{ch}:{lead.external_id}" in known]
+        if known_channels:
+            reason = f"контакт уже известен ({', '.join(known_channels)})"
+        elif not any(ch in found for ch in filters.channels):
+            reason = "найденные каналы не входят в приоритет рассылки"
+        elif phone_only_possible and not filters.whatsapp_by_phone:
+            reason = "есть только мобильный телефон, «WhatsApp по номеру» выключен"
+        elif phone_only_possible:
+            reason = "есть только телефон, но номер не распознан как мобильный для WhatsApp"
+        else:
+            reason = "не прошёл фильтры"
+        logger.info("yandex maps: карточка %r (%s) пропущена: %s", title, org_url, reason)
 
     def _wait_out_captcha(self, page: Page, leads: list[RawLead]) -> None:
         """Капча Яндекса: в видимом браузере даём человеку пройти её руками, в фоне — сдаёмся

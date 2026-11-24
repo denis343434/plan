@@ -71,15 +71,31 @@ def _ensure_docker_running() -> None:
 def _start_docker_stack() -> None:
     _ensure_docker_running()
     print("== Docker: postgres, data-service, orchestrator-service ==")
-    subprocess.run(["docker", "compose", "up", "--build", "-d"], cwd=ROOT, check=True)
     if (ROOT / "docker-compose.override.yml").exists():
-        # Гибридный режим — parser/messaging-service запускаются локально ниже, их
-        # контейнеры (остаются описанными, т.к. orchestrator ссылается на них через
-        # depends_on) держат порты 8002/8003 и должны быть остановлены.
+        # Гибридный режим: parser/messaging-service запускаются локально ниже (см.
+        # _start_local_services). Поэтому их контейнеры/образы вообще не нужны — поднимаем
+        # только контейнерную часть стека. Иначе `up --build` без списка сервисов собирал бы
+        # и 2-гигабайтные образы с Playwright, а orchestrator через depends_on тянул бы их
+        # контейнеры, которые тут же заняли бы порты 8002/8003.
+        # Сначала гасим возможные контейнеры parser/messaging с прошлых запусков — иначе
+        # локальные venv-сервисы не смогут встать на свои порты.
         subprocess.run(
             ["docker", "compose", "stop", "parser-service", "messaging-service"],
+            cwd=ROOT, check=False,
+        )
+        subprocess.run(
+            ["docker", "compose", "up", "--build", "-d", "postgres", "data-service"],
             cwd=ROOT, check=True,
         )
+        # --no-deps: depends_on у orchestrator ссылается на parser/messaging, которые в
+        # гибридном режиме живут вне Docker (см. PARSER_SERVICE_URL/MESSAGING_SERVICE_URL
+        # на host.docker.internal в docker-compose.override.yml).
+        subprocess.run(
+            ["docker", "compose", "up", "--build", "-d", "--no-deps", "orchestrator-service"],
+            cwd=ROOT, check=True,
+        )
+    else:
+        subprocess.run(["docker", "compose", "up", "--build", "-d"], cwd=ROOT, check=True)
     for name, port in DOCKER_HEALTH_PORTS.items():
         if not _wait_for(port):
             print(f"! {name} не ответил за 60с — смотри `docker compose logs {name}`")
@@ -147,7 +163,11 @@ def _start_gui() -> None:
             cwd=ROOT,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            close_fds=False,
+            # close_fds=False заставлял GUI наследовать вообще все хэндлы вызывающего
+            # процесса — в том числе пайпы терминала/IDE. Из-за этого запуск run.py выглядел
+            # «вечно работающим»: пайп оставался открытым, пока открыто окно (замечено
+            # 2026-11-24). Наследуемые явно переданные stdout/stderr работают и при True.
+            close_fds=True,
         )
 
 

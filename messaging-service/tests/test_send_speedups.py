@@ -1,11 +1,14 @@
+import uuid
 from unittest.mock import MagicMock, patch
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app import ratelimit
 from app.adapter_pool import SendAdapterPool
+from app.adapters.base import SendResult
 from app.adapters.vk import VkSendAdapter
 from app.config import settings
+from app.tasks import SendTask, _process_lead
 
 _LEAD = {"id": "lead-1", "group_url": "https://vk.com/some_group", "external_id": "777"}
 _ACCOUNT = {"id": "acc-1"}
@@ -148,6 +151,38 @@ def test_delay_for_platform_uses_instagram_range(monkeypatch):
     ]
 
 
+def test_whatsapp_cycle_is_random_110_to_125_and_accounts_for_elapsed(monkeypatch):
+    monkeypatch.setattr(settings, "WA_CYCLE_MIN_SEC", 110.0)
+    monkeypatch.setattr(settings, "WA_CYCLE_MAX_SEC", 125.0)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        ratelimit, "_sleep", lambda seconds, should_stop=None: sleeps.append(seconds)
+    )
+    ranges: list[tuple[float, float]] = []
+
+    def fake_uniform(lo, hi):
+        ranges.append((lo, hi))
+        return 118.0
+
+    monkeypatch.setattr(ratelimit.random, "uniform", fake_uniform)
+
+    ratelimit.delay_for_platform("whatsapp", elapsed_sec=10.0)
+    ratelimit.delay_for_platform("whatsapp", elapsed_sec=125.0)
+
+    assert ranges == [(110.0, 125.0), (110.0, 125.0)]
+    assert sleeps == [108.0, 0.0]  # цель 118с минус уже потраченное время
+
+
+def test_manual_whatsapp_reply_keeps_legacy_pause(monkeypatch):
+    monkeypatch.setattr(settings, "WA_CYCLE_MIN_SEC", 110.0)
+    calls = []
+    monkeypatch.setattr(ratelimit, "delay", lambda lo, hi: calls.append((lo, hi)))
+
+    ratelimit.delay_for_platform("whatsapp")  # elapsed_sec=None — ручной ответ
+
+    assert calls == [(settings.WA_MIN_DELAY_SEC, settings.WA_MAX_DELAY_SEC)]
+
+
 def test_two_opened_accounts_share_one_playwright_driver_per_thread():
     # Регрессия 2026-09-28: второй аккаунт в пуле открывал второй sync_playwright() в том же
     # потоке, пока первый ещё жив — настоящий Playwright на это падает "...Sync API inside the
@@ -182,3 +217,83 @@ def test_two_opened_accounts_share_one_playwright_driver_per_thread():
     assert pw.chromium.launch.call_count == 3
     assert pw_cm.__enter__.call_count == 1
     assert active["n"] == 0
+
+
+class _PauseClient:
+    def __init__(self) -> None:
+        self.statuses: list[tuple[str, str]] = []
+        self.messages: list[dict] = []
+        self.released: list[str] = []
+
+    def next_available_account(self, **kwargs):
+        return {"id": "acc-1", "login": "wa"}
+
+    def release_account(self, account_id):
+        self.released.append(account_id)
+
+    def patch_lead_status(self, lead_id, status):
+        self.statuses.append((lead_id, status))
+
+    def post_message(self, payload):
+        self.messages.append(payload)
+
+
+class _ResultAdapter:
+    def __init__(self, result: SendResult) -> None:
+        self.result = result
+
+    def send_message(self, lead, account, text, image=None):
+        return self.result
+
+
+class _PausePool:
+    def __init__(self, result: SendResult) -> None:
+        self.result = result
+
+    def get(self, account, platform):
+        return _ResultAdapter(self.result)
+
+    def discard(self, account, platform):
+        return None
+
+
+def _run_process_lead(monkeypatch, result: SendResult):
+    pauses: list[str] = []
+    monkeypatch.setattr(
+        ratelimit, "delay_for_platform", lambda platform, **kwargs: pauses.append(platform)
+    )
+    client = _PauseClient()
+    task = SendTask(campaign_id=uuid.uuid4())
+    lead = {
+        "id": "lead-1",
+        "platform": "whatsapp",
+        "title": "Кафе Миндаль",
+        "group_url": "https://wa.me/79518677086",
+    }
+    templates = [{"body": "Здравствуйте, {{org_name}}", "variant": "A"}]
+    ok = _process_lead(client, _PausePool(result), task, lead, templates)
+    return ok, pauses, client, task
+
+
+def test_unreachable_lead_does_not_pay_inter_lead_pause(monkeypatch):
+    ok, pauses, client, task = _run_process_lead(
+        monkeypatch,
+        SendResult(success=False, error="номер не найден в WhatsApp", unreachable=True),
+    )
+
+    assert ok
+    assert pauses == []
+    assert task.skipped == 1
+    assert client.statuses == [("lead-1", "rejected")]
+    assert client.messages == []
+
+
+def test_sent_lead_still_pays_inter_lead_pause(monkeypatch):
+    ok, pauses, client, task = _run_process_lead(monkeypatch, SendResult(success=True))
+
+    assert ok
+    assert pauses == ["whatsapp"]
+    assert task.sent == 1
+    assert client.statuses == [("lead-1", "contacted")]
+    assert client.messages[0]["delivery_status"] == "sent"
+

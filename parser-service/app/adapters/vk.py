@@ -344,6 +344,7 @@ class VkParserAdapter:
                 # (весь смысл инструмента — искать сообщества БЕЗ своего сайта, см. architecture.md).
                 want_site = filters.has_site is True
                 total = len(candidates)
+                logger.info("vk: %d candidate communities for %r", total, keyword)
                 if on_progress is not None:
                     on_progress(0, total, 0)
                 for checked, lead in enumerate(candidates, start=1):
@@ -403,16 +404,18 @@ class VkParserAdapter:
             raise RuntimeError("VK не догрузился — строка поиска в шапке не появилась за 30с")
         self._raise_if_captcha(page, collected_so_far)
 
-        search_input.click()
-        search_input.type(keyword, delay=random.uniform(30, 80))
+        self._enter_search_query(page, search_input, keyword)
         self._sleep_random()
         page.keyboard.press("Enter")
+        logger.info("vk: search for %r submitted (url %s)", keyword, page.url)
 
         # Ждём именно "Результаты поиска" (см. комментарий у _SEARCH_RESULTS_LABEL) — маркер
         # настоящей страницы результатов, а не мимолётной подсказки-автокомплита. Раньше это
         # был поиск заголовка по [data-testid="header"], теперь testid нет — берём текст.
         if not self._wait_for_text(page, _SEARCH_RESULTS_LABEL, timeout=20_000):
+            logger.info("vk: results page for %r did not appear within 20s (url %s)", keyword, page.url)
             return  # настоящая страница результатов не подгрузилась за 20с — 0 карточек
+        logger.info("vk: results page shown for %r", keyword)
         self._raise_if_captcha(page, collected_so_far)
 
         # Секция "Сообщества" может дорисовываться уже ПОСЛЕ "Результаты поиска". Кнопка
@@ -423,6 +426,48 @@ class VkParserAdapter:
             return  # все найденные сообщества уже показаны на странице результатов
         show_all.click()
         page.wait_for_timeout(2000)  # переход внутри SPA, не полная навигация — короткая пауза
+
+    def _enter_search_query(self, page: Page, search_input, keyword: str) -> None:
+        """Вводит запрос в строку поиска и ПРОВЕРЯЕТ, что он реально там оказался.
+
+        Раньше просто вызывался type(), и если VK отдал несколько input[type=search] (в
+        редизайне ноябрь-2026 есть и скрытый legacy-инпут), символы могли уйти не в то поле:
+        снаружи это выглядело как "парсер не написал в поиск", а VK открывал выдачу с пустым
+        запросом. Теперь после type() сверяем input_value() и при расхождении добиваем fill()
+        (он корректно работает с React-контролируемыми полями); если и это не помогло — явная
+        ошибка прогона вместо тихого поиска "ни о чём".
+        """
+        query = keyword.strip()
+        search_input.click()
+        try:
+            search_input.fill("")  # очистить возможный старый запрос/подсказку
+        except Exception:  # noqa: BLE001 - не всякий input поддерживает fill, дальше попробуем type
+            logger.debug("vk: search input does not support fill()", exc_info=True)
+        search_input.type(keyword, delay=random.uniform(30, 80))
+
+        value = self._search_input_value(search_input)
+        if value != query:
+            logger.warning(
+                "vk: type() left %r in the search input instead of %r, retrying with fill()", value, query
+            )
+            try:
+                search_input.fill(keyword)
+            except Exception:  # noqa: BLE001
+                logger.warning("vk: fill() failed for the search input", exc_info=True)
+            value = self._search_input_value(search_input)
+        if value != query:
+            raise RuntimeError(
+                f"VK: запрос {query!r} не попал в строку поиска (в поле осталось {value!r}) — "
+                "поиск ушёл бы пустым, прогон остановлен"
+            )
+        logger.info("vk: search query %r entered into the input", query)
+
+    @staticmethod
+    def _search_input_value(search_input) -> str:
+        try:
+            return (search_input.input_value() or "").strip()
+        except Exception:  # noqa: BLE001 - например, элемент перестал быть input после навигации
+            return ""
 
     def _search_communities_anonymous(
         self, page: Page, keyword: str, filters: ParseFilters, collected_so_far: list[RawLead]

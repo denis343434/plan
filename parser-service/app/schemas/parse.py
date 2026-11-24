@@ -6,8 +6,10 @@ from pydantic import BaseModel
 class ParseFiltersSchema(BaseModel):
     has_site: bool | None = None
     max_groups: int | None = None
-    # yandex_maps — см. ParseFilters в adapters/base.py.
+    # yandex_maps — см. ParseFilters в adapters/base.py. country добавился позже (выбор страны
+    # в desktop-client), поэтому None должен оставаться рабочим значением для старых кампаний.
     city: str | None = None
+    country: str | None = None
     channels: list[str] | None = None
     whatsapp_by_phone: bool = False
     search_socials: bool = False

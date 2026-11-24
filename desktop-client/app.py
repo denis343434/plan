@@ -509,6 +509,7 @@ class App(tk.Tk):
         self.max_groups_entry.pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Запустить", style="Accent.TButton", command=self.on_start_campaign).pack(side="left", padx=2)
         ttk.Button(btns, text="Запустить рассылку", command=self.on_start_new_leads_send).pack(side="left", padx=2)
+        ttk.Button(btns, text="Стоп", style="Danger.TButton", command=self.on_stop_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Повторить с ошибками", command=self.on_retry_failed_send).pack(side="left", padx=2)
         ttk.Button(btns, text="Отправить повторные", command=self.on_send_followups).pack(side="left", padx=2)
         ttk.Button(btns, text="Обновить", command=self.refresh_detail).pack(side="left", padx=2)
@@ -1256,6 +1257,35 @@ class App(tk.Tk):
     def on_retry_failed_send(self) -> None:
         self._start_direct_send(retry_failed=True)
 
+    def on_stop_send(self) -> None:
+        # Останавливает текущую рассылку Messaging Service: текущий лид дописывается, следующие
+        # не берутся. Работает и для рассылки, запущенной напрямую, и для фазы messaging
+        # Orchestrator — он увидит status=stopped и снимет кампанию с выполнения.
+        if not self.selected_campaign_id:
+            return
+        campaign_id = self.selected_campaign_id
+        self.flash_status("Останавливаю рассылку…")
+
+        def stop():
+            return api_request(MESSAGING_URL, f"/campaigns/{campaign_id}/stop", method="POST")
+
+        def done(result):
+            status = (result or {}).get("status")
+            if status == "stopped":
+                self._retry_send_campaign_id = None
+                self.detail_progress_label.configure(text="")
+                self.flash_status("Рассылка остановлена")
+                self.refresh_leads()
+                return
+            self._retry_send_campaign_id = campaign_id
+            self.after(1000, lambda: self._poll_retry_send(campaign_id))
+
+        def error(exc):
+            self._retry_send_campaign_id = None
+            messagebox.showinfo("Рассылка", f"Не удалось остановить рассылку: {exc}")
+
+        self.run_bg(stop, on_done=done, on_error=error)
+
     def _start_direct_send(self, retry_failed: bool) -> None:
         if not self.selected_campaign_id:
             return
@@ -1315,16 +1345,33 @@ class App(tk.Tk):
                 return
 
             self._retry_send_campaign_id = None
+            if status == "stopped":
+                self.detail_progress_label.configure(
+                    text=f"Рассылка остановлена: отправлено {result['sent']}, ошибок {result['failed']}"
+                )
+                self.flash_status("Рассылка остановлена")
+                self.refresh_leads()
+                return
             if status == "failed":
                 self.detail_progress_label.configure(text="")
                 messagebox.showerror("Рассылка", result.get("error") or "не удалось запустить рассылку")
                 return
             if status == "waiting_for_account":
+                reason = result.get("error")
                 self.detail_progress_label.configure(
                     text=f"Рассылка приостановлена: нет свободного аккаунта "
                     f"(отправлено {result['sent']}, ошибок {result['failed']})"
                 )
-                self.flash_status("Рассылка приостановлена: нет свободного аккаунта")
+                self.flash_status("Рассылка приостановлена: нет свободного аккаунта", is_err=True)
+                messagebox.showwarning(
+                    "Рассылка",
+                    f"Рассылка остановлена: нет свободного аккаунта "
+                    f"(отправлено {result['sent']}, ошибок {result['failed']})."
+                    + (f"\n\nПричина: {reason}" if reason else "")
+                    + "\n\nПроверьте панель аккаунтов: нужен аккаунт нужной платформы со входом "
+                    "и без паузы. Для WhatsApp нажмите «Войти в WhatsApp», после входа — "
+                    "«Продолжить», чтобы снять паузу, и запустите рассылку снова.",
+                )
                 self.refresh_leads()
                 return
 
@@ -1495,7 +1542,11 @@ class App(tk.Tk):
             return
 
         def fetch():
-            return api_request(DATA_URL, f"/leads?campaign_id={campaign_id}")
+            # limit обязателен: у /leads дефолт 50 записей (и они отсортированы по found_at
+            # по возрастанию). На кампании с 60+ лидами таблица показывала только самые старые
+            # 50, и только что найденные группы в неё уже не попадали — выглядело так, будто
+            # парсер ничего не добавил. Та же страховка, что у вкладки Яндекс/Google Карт.
+            return api_request(DATA_URL, f"/leads?campaign_id={campaign_id}&limit=2000")
 
         def done(leads):
             if campaign_id != self.selected_campaign_id:

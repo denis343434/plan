@@ -28,6 +28,11 @@ def _make_page(
 ) -> tuple[MagicMock, MagicMock, MagicMock | None]:
     page = MagicMock()
     search_input = MagicMock()
+    # _enter_search_query сверяет input_value() с запросом: эмулируем обычное поле, в которое
+    # type() действительно вводит текст (иначе adapter справедливо считает, что запрос не введён).
+    search_input.input_value.side_effect = lambda: (
+        search_input.type.call_args.args[0] if search_input.type.called else ""
+    )
     show_all = MagicMock() if show_all_present else None
 
     def wait_for_selector(selector: str, timeout: int | None = None):

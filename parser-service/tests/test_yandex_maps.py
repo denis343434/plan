@@ -7,6 +7,7 @@ import respx
 
 from app.adapters import contacts
 from app.adapters.base import ParseFilters
+from app.adapters.yandex_maps import _search_query
 from app.adapters.yandex_maps_fake import FakeYandexMapsAdapter
 from app.config import settings
 from app.schemas.parse import ParseFiltersSchema
@@ -73,13 +74,68 @@ def test_pick_lead_follows_priority_and_skips_known_org():
 
 def test_phone_helpers():
     assert contacts.phone_digits("+7 (960) 033-30-53") == "79600333053"
-    assert contacts.is_ru_mobile("79600333053")
-    assert not contacts.is_ru_mobile("78432000000")
+    assert contacts.is_mobile_for_whatsapp("79600333053")  # Россия, мобильный
+    assert not contacts.is_mobile_for_whatsapp("78432000000")  # Россия, городской
+
+
+def test_mobile_for_whatsapp_accepts_kazakhstan_and_rejects_landlines():
+    # Регрессия: в кампании «ресторан — Алматы» WhatsApp по номеру не срабатывал вообще,
+    # потому что проверялись только российские +7 9xx. Казахстанские мобильные — +7 70x/77x.
+    assert contacts.is_mobile_for_whatsapp("77084145046")  # +7 708 ...
+    assert contacts.is_mobile_for_whatsapp("77767006969")  # +7 776 ...
+    assert contacts.is_mobile_for_whatsapp("77475621355")  # +7 747 ...
+    assert not contacts.is_mobile_for_whatsapp("77272615601")  # Алматы, городской +7 727
+    assert contacts.is_mobile_for_whatsapp("375291131188")  # Беларусь, +375 29
+    assert not contacts.is_mobile_for_whatsapp("375172000000")  # Беларусь, Минск +375 17
 
 
 def test_fake_adapter_respects_channels():
     leads = FakeYandexMapsAdapter().search_communities("кафе", ParseFilters(city="Казань", channels=("tg",)))
     assert [lead.platform for lead in leads] == ["tg", "tg"]
+
+
+def test_search_query_appends_country():
+    assert _search_query("кафе", ParseFilters(city="Минск", country="Беларусь")) == "кафе Минск Беларусь"
+    assert _search_query("кафе", ParseFilters(city="Казань", country="Россия")) == "кафе Казань Россия"
+    # Старые кампании без страны — прежний запрос «вид деятельности + город».
+    assert _search_query("кафе", ParseFilters(city="Казань")) == "кафе Казань"
+    assert _search_query("кафе", ParseFilters(city="Казань", country="   ")) == "кафе Казань"
+    assert _search_query("кафе", ParseFilters(country="Беларусь")) == "кафе Беларусь"
+
+
+def test_parse_filters_schema_passes_country():
+    assert ParseFiltersSchema(city="Минск").country is None
+    assert ParseFiltersSchema(city="Минск", country="Беларусь").country == "Беларусь"
+
+
+def test_fake_adapter_separates_same_city_in_different_countries():
+    belarus = FakeYandexMapsAdapter().search_communities(
+        "кафе", ParseFilters(city="Брест", country="Беларусь")
+    )
+    russia = FakeYandexMapsAdapter().search_communities(
+        "кафе", ParseFilters(city="Брест", country="Россия")
+    )
+    assert {lead.external_id for lead in belarus}.isdisjoint(lead.external_id for lead in russia)
+
+
+@respx.mock
+def test_yandex_task_passes_country_from_campaign_filters():
+    respx.get(f"{BASE}/leads").mock(return_value=httpx.Response(200, json=[]))
+    bulk_route = respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 1, "skipped": 0, "lead_ids": []})
+    )
+
+    task = create_task("yandex_maps", "кафе")
+    run_parse_task(
+        task.task_id, "yandex_maps", "кафе",
+        ParseFiltersSchema(city="Минск", country="Беларусь", channels=["tg"]),
+        uuid.uuid4(), use_account=False,
+    )
+
+    assert task.status == TaskStatus.done, task.error
+    sent = json.loads(bulk_route.calls.last.request.content)
+    # Fake-адаптер кладёт страну в заголовок лида — значит filters.country дошёл до адаптера.
+    assert all("Беларусь" in lead["title"] for lead in sent)
 
 
 @respx.mock

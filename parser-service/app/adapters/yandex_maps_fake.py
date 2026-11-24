@@ -24,8 +24,9 @@ class FakeYandexMapsAdapter:
         on_progress: Callable[[int, int, int], None] | None = None,
     ) -> list[RawLead]:
         # Ники мессенджеров — только латиница, поэтому не из самого (обычно кириллического)
-        # запроса, а из его детерминированного хэша.
-        slug = f"{self._slug_prefix}{zlib.crc32(f'{keyword}|{filters.city}'.encode()):08x}"
+        # запроса, а из его детерминированного хэша. Страна входит в хэш: «кафе, Брест,
+        # Беларусь» и «кафе, Брест, Россия» — разные организации.
+        slug = f"{self._slug_prefix}{zlib.crc32(f'{keyword}|{filters.city}|{filters.country}'.encode()):08x}"
         orgs = [
             ["https://vk.com/fake_{0}_1".format(slug), "https://t.me/fake_{0}_1".format(slug)],
             ["https://t.me/fake_{0}_2".format(slug)],
@@ -36,7 +37,7 @@ class FakeYandexMapsAdapter:
         for checked, hrefs in enumerate(orgs, start=1):
             lead = contacts.pick_lead(contacts.channel_leads(hrefs), filters.channels, filters.known_external_ids)
             if lead is not None and len(leads) < limit:
-                lead.title = f"{keyword} {filters.city or ''} #{checked}".strip()
+                lead.title = f"{keyword} {filters.city or ''} {filters.country or ''} #{checked}".strip()
                 leads.append(lead)
             if on_progress is not None:
                 on_progress(checked, len(orgs), len(leads))

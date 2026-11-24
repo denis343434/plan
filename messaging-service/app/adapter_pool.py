@@ -39,7 +39,12 @@ class SendAdapterPool:
             self._adapters.move_to_end(key)
             return adapter
 
-        session = self._client.get_session(account["id"])
+        # WhatsApp Desktop авторизуется сам в приложении — сохранённая web-сессия ему не нужна
+        # (и может быть протухшей, из-за чего обычный режим playwright не стартовал бы).
+        if platform == "whatsapp" and settings.WA_ADAPTER_MODE == "desktop":
+            session = {"storage_state": {}}
+        else:
+            session = self._client.get_session(account["id"])
         adapter = self._adapter_factory(platform, session["storage_state"])
         while len(self._adapters) >= max(1, settings.SEND_MAX_OPEN_BROWSERS):
             _, oldest = self._adapters.popitem(last=False)

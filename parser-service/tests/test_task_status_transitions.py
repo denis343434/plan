@@ -328,3 +328,73 @@ def test_browser_crash_saves_partial_leads_and_releases_account(monkeypatch):
     assert task.inserted == 1
     assert bulk_route.called
     assert release_route.called
+
+
+@respx.mock
+def test_vk_task_dedupes_against_leads_from_all_pages(monkeypatch):
+    """Регрессия "Строительство домов": dedup-список ограничивался первыми 5000 лидами, поэтому
+    группы, найденные кампанией позже, парсер считал новыми, заново проверял сайт, а bulk-вставка
+    их пропускала. Здесь вторая страница /leads должна попасть в known_external_ids."""
+    from app.clients.data_service import DataServiceClient
+
+    monkeypatch.setattr(DataServiceClient, "_LEADS_PAGE_SIZE", 2)
+    account_id = str(uuid.uuid4())
+    respx.post(f"{BASE}/accounts/next-available").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id))
+    )
+    respx.get(f"{BASE}/accounts/{account_id}/session").mock(
+        return_value=httpx.Response(
+            200,
+            json={"account_id": account_id, "storage_state": {}, "updated_at": "2026-01-01T00:00:00"},
+        )
+    )
+    pages = {
+        0: ["old_group_1", "old_group_2"],
+        2: ["old_group_3"],
+    }
+
+    def leads_handler(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params.get("offset", 0))
+        ids = pages.get(offset, [])
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(uuid.uuid4()),
+                    "platform": "vk",
+                    "external_id": external_id,
+                    "group_url": f"https://vk.com/{external_id}",
+                    "admin_contact": None,
+                    "title": None,
+                    "status": "new",
+                    "campaign_id": None,
+                    "found_at": "2026-01-01T00:00:00",
+                }
+                for external_id in ids
+            ],
+        )
+
+    respx.get(f"{BASE}/leads").mock(side_effect=leads_handler)
+    respx.post(f"{BASE}/leads/bulk").mock(
+        return_value=httpx.Response(200, json={"inserted": 0, "skipped": 0, "lead_ids": []})
+    )
+    respx.post(f"{BASE}/accounts/{account_id}/release").mock(
+        return_value=httpx.Response(200, json=_account_payload(account_id, status="active"))
+    )
+
+    captured_filters = {}
+
+    class _CapturingAdapter:
+        def search_communities(self, keyword, filters, on_progress=None):
+            captured_filters["filters"] = filters
+            return []
+
+    monkeypatch.setattr("app.tasks.get_adapter", lambda platform, storage_state=None: _CapturingAdapter())
+
+    task = create_task("vk", "fitness")
+    run_parse_task(task.task_id, "vk", "fitness", ParseFiltersSchema(), None)
+
+    assert task.status == TaskStatus.done, task.error
+    assert captured_filters["filters"].known_external_ids == frozenset(
+        {"old_group_1", "old_group_2", "old_group_3"}
+    )

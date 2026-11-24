@@ -78,9 +78,34 @@ class Settings(BaseSettings):
     # скрипт входа parser-service/scripts/messenger_manual_login.py — у аккаунта не должен
     # прыгать IP между входом и рассылкой. Только через .env, креды в коде не хранить.
     TG_PROXY: str = ""
-    WA_ADAPTER_MODE: str = "fake"  # fake | playwright
-    WA_MIN_DELAY_SEC: float = 10.0
-    WA_MAX_DELAY_SEC: float = 25.0
+    WA_ADAPTER_MODE: str = "fake"  # fake | playwright | desktop
+    # Длительность ОДНОГО цикла WhatsApp — от начала обработки лида (получение аккаунта,
+    # отправка, запись в БД) до начала следующего. Случайное значение в диапазоне [MIN, MAX]:
+    # пауза добирает остаток, а не добавляется сверху (отправка 10с при цели 118с → пауза ~108с).
+    # 0 в MIN — выключить и вернуться к WA_MIN/MAX_DELAY_SEC ниже.
+    WA_CYCLE_MIN_SEC: float = 110.0
+    WA_CYCLE_MAX_SEC: float = 125.0
+    # Исторический фиксированный интервал (85-95с): используется, если WA_CYCLE_MIN_SEC=0,
+    # а также для ручных ответов (reply.py не передаёт elapsed).
+    WA_MIN_DELAY_SEC: float = 85.0
+    WA_MAX_DELAY_SEC: float = 95.0
+    # WhatsApp Desktop (Store-приложение) вместо WhatsApp Web: бот открывает чат по номеру через
+    # whatsapp://, вставляет текст и жмёт Enter; приложение остаётся открытым между лидами.
+    # Работает только когда messaging-service запущен локально на Windows (не в Docker).
+    WA_DESKTOP_WINDOW_TIMEOUT_SEC: float = 30.0
+    # Максимальное ожидание открытия нужного чата, а НЕ фиксированная пауза: адаптер опрашивает
+    # шапку/маркер недействительного номера и выходит сразу, как только чат готов (обычно 1-2с
+    # вместо прежних 5с). Потолок остаётся тем же — на холодном старте приложения чат может
+    # открываться долго.
+    WA_DESKTOP_CHAT_DELAY_SEC: float = 5.0
+    WA_DESKTOP_SEND_SETTLE_SEC: float = 1.0
+    # Пауза между символами при наборе текста в поле ввода WhatsApp Desktop (не через буфер:
+    # вставка Ctrl+V в приложении срабатывает нестабильно).
+    WA_DESKTOP_TYPING_PAUSE_SEC: float = 0.005
+    # Куда кликать, чтобы сфокусировать поле ввода: доля ширины окна и отступ от низа.
+    # Подобрано на окне WhatsApp Desktop 1408x852 (поле ввода — по центру внизу).
+    WA_DESKTOP_COMPOSE_X_RATIO: float = 0.64
+    WA_DESKTOP_COMPOSE_BOTTOM_OFFSET: int = 44
     # Facebook Messenger (лиды из Google Карт, FacebookSendAdapter в adapters/web_messenger.py).
     FB_ADAPTER_MODE: str = "fake"  # fake | playwright
     FB_MIN_DELAY_SEC: float = 10.0
